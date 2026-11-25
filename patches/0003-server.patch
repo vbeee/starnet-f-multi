@@ -1,0 +1,651 @@
+From 2ba8c7af00784d59cf49483af645869c22a009d6 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:33:46 -0800
+Subject: [PATCH] Authenticate headless browser access and resume server-owned
+ station state
+
+---
+ frontend/app/cloudsave.js            |  8 +++
+ frontend/app/harness.js              | 22 ++++++--
+ package.json                         |  3 +-
+ scripts/nexus-server.js              | 10 ++++
+ sidecar/index.js                     | 24 ++++++---
+ sidecar/nexus-access.js              | 37 +++++++++++++
+ website/app/app/app.js               | 19 +++++--
+ website/app/app/cloudsave.js         |  8 +++
+ website/app/app/harness.js           | 23 ++++++--
+ website/app/app/modeldock.js         |  8 +--
+ website/app/app/nexus-network.js     | 81 ++++++++++++++++++++++++++++
+ website/app/app/provider-registry.js | 16 +++++-
+ website/app/app/stationui.js         |  1 +
+ website/app/index.html               |  2 +
+ 14 files changed, 239 insertions(+), 23 deletions(-)
+ create mode 100644 scripts/nexus-server.js
+ create mode 100644 sidecar/nexus-access.js
+ create mode 100644 website/app/app/nexus-network.js
+
+diff --git a/frontend/app/cloudsave.js b/frontend/app/cloudsave.js
+index 321939363..ec6a9d4b7 100644
+--- a/frontend/app/cloudsave.js
++++ b/frontend/app/cloudsave.js
+@@ -883,6 +883,14 @@ const CloudSave = (() => {
+     base = null; unsureDoc = null; pushedIds = new Set();
+     let remote = null;
+     try { remote = await pull(); } catch (_) { remote = null; }
++    if (globalThis.__NEXUS_SERVER__) {
++      if (!isSave(remote)) return lastPullOutcome === 'empty' ? null : unknownSentinel(lastPullOutcome);
++      if (isFutureSave(remote)) return futureSentinel(num(remote.version));
++      revision = num(remote._saveRevision);
++      base = remote;
++      try { localStorage.setItem(cacheKey(), JSON.stringify(remote)); } catch (_) {}
++      return remote;
++    }
+     if (!isSave(remote)) {
+       // No durable doc came back. WHY matters: 'empty' is the sidecar's definitive "no save here" (seed it
+       // from local / genuinely first run). 'forbidden'/'unreachable' proved NOTHING — with no local cache
+diff --git a/frontend/app/harness.js b/frontend/app/harness.js
+index 140c33136..7474b6a7e 100644
+--- a/frontend/app/harness.js
++++ b/frontend/app/harness.js
+@@ -541,7 +541,14 @@ const Harness = (() => {
+   function hasStoredCredential(provider) { return readiness(provider).credential.present === true; }
+ 
+   // getKey() returns the real key in the browser; in desktop it returns '' (the key isn't here).
+-  const getKey = provider => DESKTOP ? '' : readScoped(LS.key, provider);
++  async function saveStationField(provider,field,value) {
++    const response = await fetch('/api/providers/engine-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider,field,[field]:value})});
++    if (!response.ok) throw Error('Station credential update failed (HTTP '+response.status+')');
++    readinessCache.invalidate(provider);
++    await refreshProviderReadiness();
++    return {engine:{ok:true},count:Array.isArray(value) ? value.length : undefined};
++  }
++  const getKey = provider => DESKTOP || globalThis.__NEXUS_SERVER__ ? '' : readScoped(LS.key, provider);
+   const setKey = (k, provider) => {
+     selectionRevision++;
+     const p = normalizeProviderId(provider || getProv());
+@@ -560,6 +567,7 @@ const Harness = (() => {
+         .then(async r => { await setDesktopConfigured(p, on); return r; })
+         .catch(e => { setDesktopConfigured(p, false); throw e; });
+     }
++    if (globalThis.__NEXUS_SERVER__) return saveStationField(p,'key',k || '');
+     writeScoped(LS.key, p, k || '');
+     readinessCache.invalidate(p);
+     return syncEngineKey(p).then(async engine => { readinessCache.invalidate(p); await refreshProviderReadiness(); return { engine }; });   // #89: resolves (never rejects) with whether routines have it
+@@ -581,6 +589,7 @@ const Harness = (() => {
+           return { count };
+         });
+     }
++    if (globalThis.__NEXUS_SERVER__) return saveStationField(p,'keyPool',cleaned);
+     writeScoped(LS.keyPool, p, JSON.stringify(cleaned));
+     readinessCache.invalidate(p);
+     // #89: the station's copy follows the backups too — resolves { count, engine } like setKey's { engine }
+@@ -672,7 +681,13 @@ const Harness = (() => {
+     const jobs = [];
+     for (const p of seen) {
+       const c = engineConfigOf(p);
+-      if (c.key || c.keyPool.length || c.baseUrl || engineSyncState(p).pending) jobs.push(syncEngineKey(p, true));
++      if (c.key || c.keyPool.length || c.baseUrl || engineSyncState(p).pending) jobs.push(syncEngineKey(p, true).then(result => {
++        if (globalThis.__NEXUS_SERVER__ && result.ok && !result.stale) for (const base of [LS.key, LS.keyPool, LS.baseUrl]) {
++          localStorage.removeItem(providerSlot(base,p));
++          if (p === 'openrouter') localStorage.removeItem(base);
++        }
++        return result;
++      }));
+     }
+     return Promise.all(jobs);
+   }
+@@ -832,7 +847,7 @@ const Harness = (() => {
+   };
+   const getProv = () => normalizeProviderId(localStorage.getItem(LS.prov) || 'openrouter');
+   const setProv = p => { selectionRevision++; localStorage.setItem(LS.prov, normalizeProviderId(p || 'openrouter')); };
+-  const getBaseUrl = provider => readScoped(LS.baseUrl, provider);
++  const getBaseUrl = provider => globalThis.__NEXUS_SERVER__ ? '' : readScoped(LS.baseUrl, provider);
+   // GitHub #111: a rejected desktop endpoint store used to be swallowed, so SETTINGS said "saved" while the station never
+   // got the endpoint. setBaseUrl still never rejects; it resolves the failure in the { engine } shape warnIfStationLacksKey reads.
+   function desktopEndpointFailed(p, e) {
+@@ -842,6 +857,7 @@ const Harness = (() => {
+   const setBaseUrl = (u, provider) => {
+     selectionRevision++;
+     const p = normalizeProviderId(provider || getProv());
++    if (globalThis.__NEXUS_SERVER__) return saveStationField(p,'baseUrl',u || '');
+     writeScoped(LS.baseUrl, p, u || '');
+     readinessCache.invalidate(p);
+     if (DESKTOP) return invoke('harness_store_provider_key', { provider: p, baseUrl: u || '' })
+diff --git a/package.json b/package.json
+index ef606af2a..c3b37868b 100644
+--- a/package.json
++++ b/package.json
+@@ -161,7 +161,8 @@
+     "release:canary": "node scripts/update-canary.mjs",
+     "release:promotion-gate": "node scripts/release-promotion-gate.mjs",
+     "security:secrets": "node scripts/scan-history-secrets.mjs",
+-    "eval:skills": "node scripts/eval/skills.mjs"
++    "eval:skills": "node scripts/eval/skills.mjs",
++    "server": "node scripts/nexus-server.js"
+   },
+   "devDependencies": {
+     "@napi-rs/canvas": "0.1.100",
+diff --git a/scripts/nexus-server.js b/scripts/nexus-server.js
+new file mode 100644
+index 000000000..031c653f3
+--- /dev/null
++++ b/scripts/nexus-server.js
+@@ -0,0 +1,10 @@
++'use strict';
++const path = require('node:path');
++const os = require('node:os');
++if (process.getuid?.() === 0) throw Error('Run StarNet Nexus as an unprivileged user');
++process.umask(0o077);
++process.env.STARNET_NEXUS='1';
++process.env.STARNET_PORT=process.env.NEXUS_PORT || '8787';
++process.env.STARNET_WORKSPACES=path.resolve(process.env.NEXUS_DATA_DIR || path.join(os.homedir(),'.local/share/starnet-nexus/data'));
++if (process.env.NEXUS_LOG_LEVEL==='error') console.info=console.log=console.warn=()=>{};
++require('../sidecar/index');
+diff --git a/sidecar/index.js b/sidecar/index.js
+index 03c9bdd13..9bca727c1 100644
+--- a/sidecar/index.js
++++ b/sidecar/index.js
+@@ -546,6 +546,7 @@ const SPECIALIST_CLASSES = (sharedSpecialties.BUILTINS || []).map(s => ({ id: s.
+ function ENV(suffix) { const k = 'STARNET_' + suffix; return (k in process.env) ? process.env[k] : process.env['SKYNET_' + suffix]; }
+ 
+ const PORT = Number(ENV('PORT') || process.env.PORT) || 8787;
++const nexusAccess = ENV('NEXUS') === '1' ? require('./nexus-access').configure(process.env,PORT) : null;
+ const API_TOKEN = String(ENV('API_TOKEN') || crypto.randomBytes(32).toString('hex'));
+ // DEV fast-path (the `npm run dev:seed` launcher sets this): when on, the served index.html carries a small
+ // boot payload (window.__STARNET_DEV__ = {model, prov}) so a fresh browser origin auto-resumes the server-
+@@ -771,6 +772,7 @@ if (!workspaceOwnerClaim.ok) {
+     'Close the other StarNet process and restart. StarNet will not risk concurrent writes (' + ownerCode + '; ' + crashLedger.describe() + ')';
+   console.error('[process-fault] CRASH LOOP — ' + crashLedger.describe() + '; holding a degraded listener on :' + PORT + ' instead of exiting 73 again');
+   const holding = http.createServer((req, res) => {
++    if (nexusAccess) { res.writeHead(503); return res.end(); }
+     // same rebinding floor as the main server: the hold reason names the workspace path + holder PID
+     if (!isAllowedHost(req.headers.host)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('forbidden host'); }
+     const url = String(req.url || '');
+@@ -12492,7 +12494,8 @@ if (SWEEP_BACKUP_TEMPS) try {
+   for (const miss of sweepBackupTemps({ fs, path, dir: backupFile.defaultExportDir(os.homedir()) }).errors) failNote('recovery.temp.sweep', Object.assign(new Error('could not remove ' + miss.file), { code: miss.code }));
+ } catch (e) { failNote('recovery.temp.sweep', e); }
+ 
+-const server = http.createServer((req, res) => {
++const listener = (req, res) => {
++  if (nexusAccess && !nexusAccess.authorize(req,res)) return;
+   stampFailureCodes(res);   // ONE FAILURE SHAPE: every answer >= 400 below names itself in X-StarNet-Code (respond.js)
+   // DNS-REBINDING FLOOR ON EVERY PATH (2026-09-23 security audit). The Host pin used to guard only /api/* (and
+   // openai-compat's own routes), while `/` inlines the per-launch API token — a rebound page could read the secret
+@@ -12547,7 +12550,8 @@ const server = http.createServer((req, res) => {
+   return Promise.resolve(dispatchRoute(req, res))
+     .catch((e) => routeFailure(res, e))
+     .finally(() => mutationTicket.release());
+-});
++};
++const server = nexusAccess?.tls ? require('node:https').createServer(nexusAccess.tls,listener) : http.createServer(listener);
+ 
+ function rejectProcessFaultRequest(req, res) {
+   let fault = null;
+@@ -13828,7 +13832,7 @@ function importNexusCustom() {
+   catch (_) { console.warn('[nexus] Custom import unavailable. Existing configuration retained.'); }
+ }
+ importNexusCustom();
+-server.listen(PORT, '127.0.0.1', async () => {
++server.listen(PORT, nexusAccess?.bind || '127.0.0.1', async () => {
+   verdictReview.resumeHeld(launchVerdictReview);
+   const url = 'http://127.0.0.1:' + PORT;
+   const bar = '═'.repeat(58);
+@@ -16633,6 +16637,10 @@ async function handleEngineKeySet(req, res) {
+   let body; try { body = JSON.parse(await readBody(req, 1 << 16)) || {}; } catch (_) { return json(400, { ok: false, error: 'bad json' }); }
+   const id = normalizeProviderIdFromRegistry(body.provider, '');
+   if (!id || !getProviderProfile(id) || id === 'starnet' || providerUsesCodex(id) || providerUsesDeviceOAuth(id)) return json(400, { ok: false, error: 'this provider does not take a key from the page' });
++  if (nexusAccess && body.field) {
++    if (!['key','baseUrl','keyPool'].includes(body.field)) return json(400,{error:'Invalid credential field'});
++    body = {...engineKeys.get(id), [body.field]:body[body.field]};
++  }
+   const r = credStore.putPage(id, { key: body.key, keyPool: body.keyPool, baseUrl: body.baseUrl }, { boot: body.boot === true, ifRev: typeof body.ifRev === 'string' ? body.ifRev : '' });
+   if (r.ok && id === 'custom') importNexusCustom();
+   if (r.invalid) return json(400, { ok: false, provider: id, error: r.error });
+@@ -22071,10 +22079,10 @@ async function handleRun(req, res) {
+   // the approvals it was still waiting on — the abort below denies them, and the conversation must say so after a reload.
+   // Registered FIRST: listeners run in order, so it reads the signal before the disconnect law aborts it.
+   let leadOver = false;   // this run's own finally ran: a close after it is just the stream's normal end
+-  if (!sink) {
++  if (!nexusAccess && !sink) {
+     res.on('close', () => { if (!leadOver && !ac.signal.aborted && !internal) { try { notePageClosed(runId, pending); } catch (e) { failNote('run.pageClosed.note', e); } } });
+     res.on('close', () => { ac.abort(); });
+-  } else sink.onGone(() => {
++  } else if (!nexusAccess && sink) sink.onGone(() => {
+     // on the page's shared stream (run-streams.js) the page leaving is that stream closing, or this run withdrawn: the same two
+     // steps in the same order. Never this POST's own response, which closes as soon as its receipt is sent.
+     if (!leadOver && !ac.signal.aborted && !internal) { try { notePageClosed(runId, pending); } catch (e) { failNote('run.pageClosed.note', e); } }
+@@ -22088,8 +22096,9 @@ async function handleRun(req, res) {
+   const bus = { emit: (name, payload) => {
+     if (payload && payload.runId === runId) { if (name === 'agent.run.start') leadStarted = true; else if (name === 'agent.run.end') leadEnded = true; }
+     try {
++      if (nexusAccess) chanEmit(name,{...payload,runId:payload?.runId || runId,agentId:payload?.agentId || agentId});
+       if (sink) sink.write(name, redact(payload));
+-      else res.write(JSON.stringify({ name, payload: redact(payload) }) + '\n');
++      else if (!res.destroyed) res.write(JSON.stringify({ name, payload: redact(payload) }) + '\n');
+     } catch (_) {}
+   } };
+   const emit = wrapEmitDiag(makeEmitter(bus, e => { if (e) console.warn('[event]', e.kind, e.event, (e.errors || []).join(';')); }));
+@@ -31979,11 +31988,12 @@ async function serveStatic(req, res) {
+     if (isAppPage ||
+         (DEV_MODE && abs.toLowerCase() === path.resolve(FRONTEND, 'agent-station-demo.html').toLowerCase())) {
+       const sock = req.socket || {};
+-      const peer = await peerOwnerCheck({ remoteAddress: sock.remoteAddress, remotePort: sock.remotePort, localAddress: sock.localAddress, localPort: sock.localPort });
++      const peer = nexusAccess ? {ok:true} : await peerOwnerCheck({ remoteAddress: sock.remoteAddress, remotePort: sock.remotePort, localAddress: sock.localAddress, localPort: sock.localPort });
+       // the app page gets a per-response script nonce (CSP below), so its one inline boot script runs and nothing else inline does
+       if (isAppPage) scriptNonce = crypto.randomBytes(16).toString('base64');
+       let boot = (scriptNonce ? '<script nonce="' + scriptNonce + '">' : '<script>') + (peer.ok ? 'window.__STARNET_API_TOKEN__=' + JSON.stringify(API_TOKEN) + ';'
+         : 'window.__STARNET_TOKEN_WITHHELD__=' + JSON.stringify(peer.reason) + ';');
++      if (nexusAccess) boot += 'window.__NEXUS_SERVER__=true;';
+       if (peer.ok) boot += 'window.__NEXUS_NETWORK__=' + JSON.stringify(nexus.list()).replace(/</g,'\\u003c') + ';';
+       if (!peer.ok) noteTokenWithheld(peer);
+       // DEV fast-path: hand the page a model + provider hint so a fresh origin auto-resumes the seeded
+diff --git a/sidecar/nexus-access.js b/sidecar/nexus-access.js
+new file mode 100644
+index 000000000..55012f197
+--- /dev/null
++++ b/sidecar/nexus-access.js
+@@ -0,0 +1,37 @@
++'use strict';
++const fs = require('node:fs');
++const crypto = require('node:crypto');
++const digest = value => crypto.createHash('sha256').update(value).digest();
++
++function configure(env, port) {
++  const bind = env.NEXUS_LISTEN || '127.0.0.1';
++  const tls = env.NEXUS_TLS_KEY && env.NEXUS_TLS_CERT
++    ? {key:fs.readFileSync(env.NEXUS_TLS_KEY), cert:fs.readFileSync(env.NEXUS_TLS_CERT)} : null;
++  if (!tls && !['localhost','127.0.0.1','::1'].includes(bind)) throw Error('Network listeners require a TLS key and certificate');
++  const password = env.NEXUS_PASSWORD_FILE ? fs.readFileSync(env.NEXUS_PASSWORD_FILE,'utf8').trimEnd() : env.NEXUS_PASSWORD;
++  if (!password || password.length < 24) throw Error('Configure a Nexus password of at least 24 characters');
++  const expected = digest('Basic '+Buffer.from('commander:'+password).toString('base64'));
++  delete env.NEXUS_PASSWORD;
++  const origins = new Set([env.NEXUS_PUBLIC_URL || ('http://localhost:'+port), ...String(env.NEXUS_ALLOWED_ORIGINS || '').split(',').filter(Boolean)].map(value => {
++    const u = new URL(value.trim());
++    if (u.username || u.password || u.search || u.hash || u.pathname !== '/' || (u.protocol !== 'https:' && !(u.protocol === 'http:' && ['127.0.0.1','localhost','[::1]'].includes(u.hostname)))) throw Error('Invalid Nexus origin. Remote origins require HTTPS.');
++    return u.origin;
++  }));
++  const hosts = new Set([...origins].map(o=>new URL(o).host));
++  function authorize(req,res) {
++    function reject(code) {
++      res.writeHead(code,{'Cache-Control':'no-store',...(code===401?{'WWW-Authenticate':'Basic realm="StarNet Nexus", charset="UTF-8"'}:{})});
++      res.end(code===401?'Authentication required':'Forbidden');
++      return false;
++    }
++    if (!hosts.has(req.headers.host) || req.headers.origin && !origins.has(req.headers.origin) || req.headers['sec-fetch-site']==='cross-site') return reject(403);
++    if (!crypto.timingSafeEqual(expected,digest(req.headers.authorization || ''))) return reject(401);
++    if (!['GET','HEAD','OPTIONS'].includes(req.method) && !req.headers.origin && !req.headers['x-starnet-token']) return reject(403);
++    delete req.headers.authorization;
++    req.headers.host='127.0.0.1:'+port;
++    if (req.headers.origin) req.headers.origin='http://'+req.headers.host;
++    return true;
++  }
++  return {bind,tls,authorize};
++}
++module.exports = {configure};
+diff --git a/website/app/app/app.js b/website/app/app/app.js
+index 808e9c434..88c4c907f 100644
+--- a/website/app/app/app.js
++++ b/website/app/app/app.js
+@@ -889,18 +889,18 @@ const App = (() => {
+       'claude-cli': 'CLAUDE CODE',
+       custom: 'CUSTOM'
+     };
+-    return map[provider] || String(provider || 'openrouter').toUpperCase();
++    return map[provider] || SK.providers.registry.getProviderProfile(provider)?.label || String(provider || 'openrouter').toUpperCase();
+   }
+   function normalizeProviderId(provider) {
+     return SK.providers.registry.normalizeProviderId(provider || 'openrouter', '');
+   }
+   function providerNeedsKey(provider) {
+     const p = normalizeProviderId(provider);
+-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
++    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
+   }
+   function providerUsesKeyBox(provider) {
+     const p = normalizeProviderId(provider);
+-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
++    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
+   }
+   function providerNeedsBaseUrl(provider) {
+     return normalizeProviderId(provider) === 'custom';
+@@ -1882,7 +1882,7 @@ const App = (() => {
+     // A LOCAL catalog is exactly what is installed. The seed slug ('llama3.1') is only a name Ollama resolves if that
+     // exact tag was pulled; prefilling it over a machine that has only qwen3:8b woke the agent on a model that does not
+     // exist and failed its first run. Default to an installed model instead — one Ollama says can call tools.
+-    if (p === 'ollama' && list.length && !list.some(m => m && m.id === defId)) {
++    if ((p === 'ollama' || p.startsWith('nexus-')) && list.length && !list.some(m => m && m.id === defId)) {
+       const usable = list.find(m => m && m.supportsTools !== false) || list[0];
+       if (usable && usable.id) defId = usable.id;
+     }
+@@ -3093,6 +3093,17 @@ const App = (() => {
+     el('in-name').onkeydown = enterWakes;
+     el('in-key').onkeydown = enterWakes;
+     wireModelField();   // #in-model is a search combobox over #model-pop; it owns its keydown (Enter picks a row, else WAKEs)
++    const networkPanel = el('genesis-network');
++    networkPanel.ontoggle = () => {
++      if (networkPanel.open && !networkPanel.querySelector('inference-network')) networkPanel.append(document.createElement('inference-network'));
++    };
++    networkPanel.chooseEndpoint = row => {
++      userPickedProvider = true;
++      el('in-model').value = row.model || row.models[0] || '';
++      selectProviderUI(row.id);
++      networkPanel.open = false;
++      window.OverseerSetup?.beginConnection();
++    };
+     // provider toggle + ChatGPT sign-in wiring; selectProviderUI() also loads the right model catalog.
+     // Clear the model on a real USER switch so the new provider's curated default (MODEL_PICKS[p][0]) fills
+     // instead of carrying a cross-provider slug (e.g. codex 'gpt-5.5' bleeding onto OpenRouter, which needs
+diff --git a/website/app/app/cloudsave.js b/website/app/app/cloudsave.js
+index 321939363..ec6a9d4b7 100644
+--- a/website/app/app/cloudsave.js
++++ b/website/app/app/cloudsave.js
+@@ -883,6 +883,14 @@ const CloudSave = (() => {
+     base = null; unsureDoc = null; pushedIds = new Set();
+     let remote = null;
+     try { remote = await pull(); } catch (_) { remote = null; }
++    if (globalThis.__NEXUS_SERVER__) {
++      if (!isSave(remote)) return lastPullOutcome === 'empty' ? null : unknownSentinel(lastPullOutcome);
++      if (isFutureSave(remote)) return futureSentinel(num(remote.version));
++      revision = num(remote._saveRevision);
++      base = remote;
++      try { localStorage.setItem(cacheKey(), JSON.stringify(remote)); } catch (_) {}
++      return remote;
++    }
+     if (!isSave(remote)) {
+       // No durable doc came back. WHY matters: 'empty' is the sidecar's definitive "no save here" (seed it
+       // from local / genuinely first run). 'forbidden'/'unreachable' proved NOTHING — with no local cache
+diff --git a/website/app/app/harness.js b/website/app/app/harness.js
+index 5a086dc00..7474b6a7e 100644
+--- a/website/app/app/harness.js
++++ b/website/app/app/harness.js
+@@ -485,6 +485,7 @@ const Harness = (() => {
+         const r = await fetch('/api/providers', { cache: 'no-store', signal: ctl.signal });
+         if (!r.ok) throw new Error('station status unavailable');
+         const j = await r.json();
++        if (Array.isArray(j.network)) SK.providers.registry.setNetwork(j.network);
+         if (!readinessCache.accept(j.providers, ticket)) readinessCache.offline();
+       } catch (_) { readinessCache.offline(); }
+       finally {
+@@ -540,7 +541,14 @@ const Harness = (() => {
+   function hasStoredCredential(provider) { return readiness(provider).credential.present === true; }
+ 
+   // getKey() returns the real key in the browser; in desktop it returns '' (the key isn't here).
+-  const getKey = provider => DESKTOP ? '' : readScoped(LS.key, provider);
++  async function saveStationField(provider,field,value) {
++    const response = await fetch('/api/providers/engine-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider,field,[field]:value})});
++    if (!response.ok) throw Error('Station credential update failed (HTTP '+response.status+')');
++    readinessCache.invalidate(provider);
++    await refreshProviderReadiness();
++    return {engine:{ok:true},count:Array.isArray(value) ? value.length : undefined};
++  }
++  const getKey = provider => DESKTOP || globalThis.__NEXUS_SERVER__ ? '' : readScoped(LS.key, provider);
+   const setKey = (k, provider) => {
+     selectionRevision++;
+     const p = normalizeProviderId(provider || getProv());
+@@ -559,6 +567,7 @@ const Harness = (() => {
+         .then(async r => { await setDesktopConfigured(p, on); return r; })
+         .catch(e => { setDesktopConfigured(p, false); throw e; });
+     }
++    if (globalThis.__NEXUS_SERVER__) return saveStationField(p,'key',k || '');
+     writeScoped(LS.key, p, k || '');
+     readinessCache.invalidate(p);
+     return syncEngineKey(p).then(async engine => { readinessCache.invalidate(p); await refreshProviderReadiness(); return { engine }; });   // #89: resolves (never rejects) with whether routines have it
+@@ -580,6 +589,7 @@ const Harness = (() => {
+           return { count };
+         });
+     }
++    if (globalThis.__NEXUS_SERVER__) return saveStationField(p,'keyPool',cleaned);
+     writeScoped(LS.keyPool, p, JSON.stringify(cleaned));
+     readinessCache.invalidate(p);
+     // #89: the station's copy follows the backups too — resolves { count, engine } like setKey's { engine }
+@@ -671,7 +681,13 @@ const Harness = (() => {
+     const jobs = [];
+     for (const p of seen) {
+       const c = engineConfigOf(p);
+-      if (c.key || c.keyPool.length || c.baseUrl || engineSyncState(p).pending) jobs.push(syncEngineKey(p, true));
++      if (c.key || c.keyPool.length || c.baseUrl || engineSyncState(p).pending) jobs.push(syncEngineKey(p, true).then(result => {
++        if (globalThis.__NEXUS_SERVER__ && result.ok && !result.stale) for (const base of [LS.key, LS.keyPool, LS.baseUrl]) {
++          localStorage.removeItem(providerSlot(base,p));
++          if (p === 'openrouter') localStorage.removeItem(base);
++        }
++        return result;
++      }));
+     }
+     return Promise.all(jobs);
+   }
+@@ -831,7 +847,7 @@ const Harness = (() => {
+   };
+   const getProv = () => normalizeProviderId(localStorage.getItem(LS.prov) || 'openrouter');
+   const setProv = p => { selectionRevision++; localStorage.setItem(LS.prov, normalizeProviderId(p || 'openrouter')); };
+-  const getBaseUrl = provider => readScoped(LS.baseUrl, provider);
++  const getBaseUrl = provider => globalThis.__NEXUS_SERVER__ ? '' : readScoped(LS.baseUrl, provider);
+   // GitHub #111: a rejected desktop endpoint store used to be swallowed, so SETTINGS said "saved" while the station never
+   // got the endpoint. setBaseUrl still never rejects; it resolves the failure in the { engine } shape warnIfStationLacksKey reads.
+   function desktopEndpointFailed(p, e) {
+@@ -841,6 +857,7 @@ const Harness = (() => {
+   const setBaseUrl = (u, provider) => {
+     selectionRevision++;
+     const p = normalizeProviderId(provider || getProv());
++    if (globalThis.__NEXUS_SERVER__) return saveStationField(p,'baseUrl',u || '');
+     writeScoped(LS.baseUrl, p, u || '');
+     readinessCache.invalidate(p);
+     if (DESKTOP) return invoke('harness_store_provider_key', { provider: p, baseUrl: u || '' })
+diff --git a/website/app/app/modeldock.js b/website/app/app/modeldock.js
+index 2260e53c2..dee0ae457 100644
+--- a/website/app/app/modeldock.js
++++ b/website/app/app/modeldock.js
+@@ -158,7 +158,7 @@ const ModelDock = (() => {
+   function providerLabel(p) {
+     p = normalizeProvider(p);
+     const map = { starnet: 'STARNET', codex: 'GPT / CODEX', grok: 'GROK OAUTH', kimi: 'KIMI OAUTH', openrouter: 'OPENROUTER', openai: 'OPENAI API', anthropic: 'ANTHROPIC', gemini: 'GEMINI', xai: 'XAI', groq: 'GROQ', mistral: 'MISTRAL', deepseek: 'DEEPSEEK', together: 'TOGETHER', fireworks: 'FIREWORKS', perplexity: 'PERPLEXITY', cerebras: 'CEREBRAS', ollama: 'OLLAMA', 'claude-cli': 'CLAUDE CODE', custom: 'CUSTOM' };
+-    return map[p] || String(p || 'openrouter').toUpperCase();
++    return map[p] || providerRegistry.getProviderProfile(p)?.label || String(p || 'openrouter').toUpperCase();
+   }
+   function normalizeProvider(p) {
+     return providerRegistry.normalizeProviderId(p || 'openrouter', '');
+@@ -554,6 +554,8 @@ const ModelDock = (() => {
+       // harness never confirmed exist.
+       list = (p === 'codex' ? CODEX_MODELS : p === 'anthropic' ? ANTHROPIC_MODELS : p === 'gemini' ? GEMINI_MODELS : HOSTED_FALLBACKS[p] || OPENROUTER_FALLBACK).map(m => { const item = asModel(m, p); item.fallback = true; return item; });
+     }
++    const manual = providerRegistry.getProviderProfile(p)?.manualModel;
++    if (manual && !list.some(m=>m.id===manual)) list.push(asModel({id:manual},p));
+     list = list.filter(isAgentModel);
+     list.sort((a, b) => {
+       if (p === 'openrouter') {
+@@ -576,7 +578,7 @@ const ModelDock = (() => {
+     loadTiers(!!force).then(() => { if (!loading && generation === fetchGeneration) renderList(); }).catch(() => {});
+     // 'starnet' first: a linked station's own credits are the most direct way to run, and its catalog is
+     // the whole managed lineup. providerEnabled() keeps it out of the list when no credits are configured.
+-    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'];
++    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'].concat(providerRegistry.providerIds().filter(id=>id.startsWith('nexus-')));
+     const active = provider();
+     if (ids.indexOf(active) < 0) ids.unshift(active);
+     const pending = ids.map(p => fetchProviderModels(p, force));
+@@ -1029,7 +1031,7 @@ const ModelDock = (() => {
+   async function computeCatalog(force, ensure) {
+     // #93: 'starnet' leads here exactly as in the dock — without it a per-agent picker offered managed credits only
+     // while the FOCUSED agent already ran on them. providerEnabled() drops it (empty list) when the station is unlinked.
+-    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'];
++    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'].concat(providerRegistry.providerIds().filter(id=>id.startsWith('nexus-')));
+     const active = provider();
+     if (ids.indexOf(active) < 0) ids.unshift(active);
+     const balance = refreshStarnetBalance().catch(() => {});
+diff --git a/website/app/app/nexus-network.js b/website/app/app/nexus-network.js
+new file mode 100644
+index 000000000..fbce3717b
+--- /dev/null
++++ b/website/app/app/nexus-network.js
+@@ -0,0 +1,81 @@
++'use strict';
++class InferenceNetwork extends HTMLElement {
++  connectedCallback() { this.refresh(); }
++  node(tag,text,parent=this) {
++    const el=document.createElement(tag);
++    el.textContent=text;
++    parent.append(el);
++    return el;
++  }
++  button(parent,label,action) {
++    const button=this.node('button',label,parent);
++    button.type='button'; button.className='bb sm'; button.onclick=action;
++  }
++  async refresh(payload) {
++    try {
++      const res=await fetch('/api/nexus/network',payload ? {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)} : {cache:'no-store'});
++      const rows=await res.json();
++      if (!res.ok) throw Error(rows.error || 'Network unavailable');
++      this.rows=rows;
++      SK.providers.registry.setNetwork(rows);
++      this.replaceChildren();
++      this.node('h4','Inference Network').className='ms-h';
++      this.button(this,'Add endpoint',()=>this.edit({}));
++      this.button(this,'Refresh',()=>this.refresh());
++      for (const r of rows) {
++        const box=this.node('section','');
++        this.node('strong',r.name,box);
++        const info=[r.enabled ? r.status : 'disabled',r.baseUrl,r.active+' active',r.queued+' queued',r.error];
++        if (Number.isFinite(r.latency)) info.push(r.latency+' ms');
++        if (Number.isFinite(r.speed)) info.push(r.speed.toFixed(1)+' output tokens/s (whole request)');
++        this.node('p',info.filter(Boolean).join(' · '),box);
++        this.node('p',r.models.join(', ') || r.model || 'No catalog yet',box);
++        const action=(name,extra={})=>this.refresh({action:name,id:r.id,rev:r.rev,...extra});
++        const setup=this.closest('#genesis-network');
++        if (setup && r.enabled) this.button(box,'Use this endpoint',()=>setup.chooseEndpoint(r));
++        this.button(box,'Test connection',()=>action('test'));
++        this.button(box,'Edit',()=>this.edit(r));
++        this.button(box,'Duplicate',()=>action('duplicate',{name:r.name+' copy'}));
++        this.button(box,r.enabled?'Disable':'Enable',()=>action('edit',{enabled:!r.enabled}));
++        this.button(box,'Delete',()=>{if(confirm('Delete '+r.name+'?')) action('delete');});
++      }
++    } catch(e) {this.node('p',e.message);}
++  }
++  edit(row) {
++    this.replaceChildren();
++    const form=this.node('form','');
++    const fields=[['name','Display name'],['baseUrl','API base URL including /v1'],['key','API key (blank keeps current key on same URL)'],
++      ['auth','Authentication',['bearer','x-api-key']],['protocol','Protocol',['openai','ollama']],['model','Manual model ID'],
++      ['context','Context window',0],['output','Maximum output tokens',0],['timeout','Timeout in milliseconds',120000],
++      ['concurrency','Maximum concurrent requests',1],['priority','Priority',0],['tools','Tool calling',['unknown','yes','no']],
++      ['vision','Vision',['unknown','yes','no']],['mode','Routing',['manual','priority','balance','failover','local']]];
++    for (const [name,label,options] of fields) {
++      const line=this.node('label',label+' ',this.node('p','',form));
++      const input=this.node(Array.isArray(options)?'select':'input','',line);
++      input.name=name;
++      if (Array.isArray(options)) {
++        for(const value of options) this.node('option',value,input);
++        input.value=typeof row[name]==='boolean'?(row[name]?'yes':'no'):row[name] || options[0];
++      } else {
++        input.type=name==='key'?'password':typeof options==='number'?'number':'text';
++        input.value=row[name] ?? options ?? '';
++      }
++    }
++    this.node('p','Authorized alternatives',form);
++    for(const r of this.rows.filter(r=>r.id!==row.id)) {
++      const input=this.node('input','',this.node('label',r.name+' ',form));
++      input.type='checkbox';input.name='alternate';input.value=r.id;
++      input.checked=row.alternatives?.includes(r.id) || false;
++    }
++    this.node('button','Save endpoint',form).className='bb sm';
++    this.button(form,'Cancel',()=>this.refresh());
++    form.onsubmit=event=>{
++      event.preventDefault();
++      const data=new FormData(form), values=Object.fromEntries(data);
++      if(!values.key) delete values.key;
++      for(const field of ['tools','vision']) values[field]=values[field]==='unknown'?null:values[field]==='yes';
++      this.refresh({...values,alternatives:data.getAll('alternate'),action:row.id?'edit':'add',id:row.id,rev:row.rev});
++    };
++  }
++}
++customElements.define('inference-network',InferenceNetwork);
+diff --git a/website/app/app/provider-registry.js b/website/app/app/provider-registry.js
+index ebb0b877c..bdc6f539f 100644
+--- a/website/app/app/provider-registry.js
++++ b/website/app/app/provider-registry.js
+@@ -6,7 +6,7 @@
+ (function (root, factory) {
+   const api = factory();
+   if (typeof module !== 'undefined' && module.exports) module.exports = api;
+-  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.registry = api; }
++  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.registry = api; if (root.__NEXUS_NETWORK__) api.setNetwork(root.__NEXUS_NETWORK__); }
+ })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+   'use strict';
+ 
+@@ -636,18 +636,29 @@
+     for (const a of (profile.aliases || [])) ALIASES.set(String(a).toLowerCase(), profile.id);
+   }
+ 
++  let network = new Map();
++  function setNetwork(rows) {
++    network = new Map(rows.filter(r => /^nexus-[a-f0-9-]{36}$/.test(r.id)).map(r => [r.id, {
++      ...BY_ID.get('custom'), id:r.id, name:r.name, label:r.name, aliases:[], live:r.enabled,
++      baseUrl:r.baseUrl, endpoint:r.baseUrl, keyEnv:[], baseUrlEnv:[], credentialPool:false,
++      requiresBaseUrl:false, nativeOllama:r.protocol === 'ollama', supportsTools:r.tools,
++      maxOutputTokens:r.output, connectTimeoutMs:r.timeout, manualModel:r.model
++    }]));
++  }
+   function canonicalKey(value) {
+     return String(value || '').trim().toLowerCase();
+   }
+   function getProviderProfile(value) {
+     const key = canonicalKey(value);
+     if (!key) return null;
++    if (network.has(key)) return network.get(key);
+     const id = ALIASES.get(key);
+     return id ? BY_ID.get(id) || null : null;
+   }
+   function normalizeProviderId(value, fallback) {
+     const profile = getProviderProfile(value);
+     if (profile) return profile.id;
++    if (/^nexus-[a-f0-9-]{36}$/.test(value)) return value;
+     return fallback == null ? '' : String(fallback);
+   }
+   function providerUsesCodex(value) {
+@@ -698,7 +709,7 @@
+   }
+   function listProviderProfiles(opts) {
+     opts = opts || {};
+-    return PROFILES
++    return PROFILES.concat([...network.values()])
+       .filter(p => opts.includeInactive || p.live !== false)
+       .slice()
+       .sort((a, b) => (a.order || 1000) - (b.order || 1000) || a.id.localeCompare(b.id))
+@@ -719,6 +730,7 @@
+     providerRequiresKey,
+     providerRequiresBaseUrl,
+     providerIds,
++    setNetwork,
+     _profiles: PROFILES
+   };
+ });
+diff --git a/website/app/app/stationui.js b/website/app/app/stationui.js
+index a7c895749..0ef58a0d8 100644
+--- a/website/app/app/stationui.js
++++ b/website/app/app/stationui.js
+@@ -8155,6 +8155,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
+     // settings test source-locks them). mountConsole builds these panes once and returns a content host
+     // that spans them all, so the wireX calls below reach every control with no per-section rewire.
+     const secProviders = () =>
++      '<inference-network></inference-network>' +
+       // NB: no inner "PROVIDERS" heading — the console section head already prints PROVIDERS above the pane
+       // (a second identical h4 read as a duplicated title in sys-settings.png).
+       '<div class="prov-list">' + providersHtml() + '</div>' +
+diff --git a/website/app/index.html b/website/app/index.html
+index ddb6e1da4..7ba7a5bc2 100644
+--- a/website/app/index.html
++++ b/website/app/index.html
+@@ -193,6 +193,7 @@
+           <!-- BEGINNER FUNNEL: lead with the no-API-key path. A ChatGPT Plus/Pro login (Codex OAuth) needs
+                no key at all, so it's the recommended default and sits first; BYOK (OpenRouter etc.) stays a
+                fully visible one-click alternative for anyone who already has a key. -->
++          <details id="genesis-network"><summary>Inference Network</summary></details>
+           <div class="ov-brain">
+             <!-- TWO-TIER PROVIDER PICK: the no-API-key ChatGPT path is the ONLY hero card (recommended, sits
+                  alone up top); everything else — including the other keyless OAuth sign-ins (grok/kimi) — is a
+@@ -854,6 +855,7 @@
+ <script src="app/skin-study-tone.js"></script><script src="app/skin-study-preview.js"></script>
+ <script src="js/assets.js"></script>
+ <script src="app/runoutcome.js"></script><!-- TYPED OUTCOMES: how a run ended, as ONE code (the sidecar requires the same module) — before harness.js, which resolves an older station's ending through it -->
++<script src="app/nexus-network.js"></script>
+ <script src="app/provider-registry.js"></script><!-- generated from the sidecar's provider registry -->
+ <script src="app/provider-readiness.js"></script>
+ <script src="app/harness.js"></script>
