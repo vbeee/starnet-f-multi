@@ -1,0 +1,147 @@
+From 1be9682ae4312e3015d258b17613bb0db9ad94dc Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:34:51 -0800
+Subject: [PATCH] Deploy as an unprivileged Linux user service or Docker
+ Compose service
+
+---
+ .dockerignore                |  5 +++++
+ .gitignore                   |  1 +
+ Dockerfile                   | 11 +++++++++++
+ compose.yaml                 | 15 +++++++++++++++
+ deploy/install-linux.sh      | 26 ++++++++++++++++++++++++++
+ deploy/starnet-nexus.service | 14 ++++++++++++++
+ scripts/nexus-health.js      |  9 +++++++++
+ 7 files changed, 81 insertions(+)
+ create mode 100644 .dockerignore
+ create mode 100644 Dockerfile
+ create mode 100644 compose.yaml
+ create mode 100755 deploy/install-linux.sh
+ create mode 100644 deploy/starnet-nexus.service
+ create mode 100644 scripts/nexus-health.js
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 000000000..ff4055ca9
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,5 @@
++.git
++node_modules
++nexus.env
++workspaces
++*.pem
+diff --git a/.gitignore b/.gitignore
+index 665bfe4a5..b4d959e6a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -225,3 +225,4 @@ dev/.scratch-workspace-usl-proof/
+ dev/.scratch-workspace.recovery-owner.json.generations/
+ # local gate/sweep logs and scratch output moved out of the repo root. Never committed.
+ /logs/
++/nexus.env
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 000000000..05edcccc5
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,11 @@
++FROM node:22-bookworm
++WORKDIR /opt/starnet
++ENV ONNXRUNTIME_NODE_INSTALL=skip ONNXRUNTIME_NODE_INSTALL_CUDA=skip
++COPY package*.json ./
++RUN npm ci --omit=dev
++COPY . .
++RUN install -d -o node -g node -m 700 /var/lib/starnet
++ENV NEXUS_DATA_DIR=/var/lib/starnet
++USER node
++VOLUME /var/lib/starnet
++CMD ["node","scripts/nexus-server.js"]
+diff --git a/compose.yaml b/compose.yaml
+new file mode 100644
+index 000000000..fc23fda39
+--- /dev/null
++++ b/compose.yaml
+@@ -0,0 +1,15 @@
++services:
++  station:
++    build: .
++    network_mode: host
++    env_file: nexus.env
++    volumes:
++      - station:/var/lib/starnet
++    restart: unless-stopped
++    healthcheck:
++      test: ["CMD","node","scripts/nexus-health.js"]
++      interval: 30s
++      timeout: 5s
++      retries: 3
++volumes:
++  station:
+diff --git a/deploy/install-linux.sh b/deploy/install-linux.sh
+new file mode 100755
+index 000000000..cd8b21929
+--- /dev/null
++++ b/deploy/install-linux.sh
+@@ -0,0 +1,26 @@
++#!/usr/bin/env bash
++set -euo pipefail
++[[ $(id -u) != 0 ]] || { echo 'Run as your station service user'; exit 1; }
++cd "$(dirname "$0")/.."
++node -e 'if(Number(process.versions.node.split(".")[0])<22) process.exit(1)'
++umask 077
++config="$HOME/.config/starnet-nexus"
++data="$HOME/.local/share/starnet-nexus"
++mkdir -p "$config" "$data" "$HOME/.config/systemd/user"
++[[ -e "$config/password" ]] || node -p "require('crypto').randomBytes(32).toString('base64url')" > "$config/password"
++if [[ ! -e "$config/service.env" ]]; then
++  cat > "$config/service.env" <<VARS
++PATH=$(dirname "$(command -v node)"):/usr/local/bin:/usr/bin:/bin
++NEXUS_PASSWORD_FILE="$config/password"
++NEXUS_DATA_DIR="$data/data"
++NEXUS_PUBLIC_URL=http://localhost:8787
++VARS
++fi
++ONNXRUNTIME_NODE_INSTALL=skip ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --omit=dev
++if [[ ! -e "$data/app" ]]; then ln -s "$PWD" "$data/app"; fi
++[[ "$(realpath "$data/app")" = "$PWD" ]] || { echo 'Service app link points to another checkout'; exit 1; }
++install -m 600 deploy/starnet-nexus.service "$HOME/.config/systemd/user/"
++systemctl --user daemon-reload
++systemctl --user enable --now starnet-nexus
++echo "Login as commander. The password is stored in $config/password."
++echo "To run after logout and at boot, enable lingering for $(id -un)."
+diff --git a/deploy/starnet-nexus.service b/deploy/starnet-nexus.service
+new file mode 100644
+index 000000000..5b382efa6
+--- /dev/null
++++ b/deploy/starnet-nexus.service
+@@ -0,0 +1,14 @@
++[Unit]
++Description=StarNet Nexus station
++After=network.target
++[Service]
++Type=simple
++WorkingDirectory=%h/.local/share/starnet-nexus/app
++EnvironmentFile=%h/.config/starnet-nexus/service.env
++ExecStart=/usr/bin/env node scripts/nexus-server.js
++Restart=on-failure
++RestartSec=5
++UMask=0077
++NoNewPrivileges=yes
++[Install]
++WantedBy=default.target
+diff --git a/scripts/nexus-health.js b/scripts/nexus-health.js
+new file mode 100644
+index 000000000..8648265a3
+--- /dev/null
++++ b/scripts/nexus-health.js
+@@ -0,0 +1,9 @@
++'use strict';
++const fs=require('node:fs');
++const port=process.env.NEXUS_PORT || '8787';
++const url=new URL(process.env.NEXUS_PUBLIC_URL || 'http://localhost:'+port);
++const secure=!!process.env.NEXUS_TLS_CERT;
++const password=process.env.NEXUS_PASSWORD_FILE ? fs.readFileSync(process.env.NEXUS_PASSWORD_FILE,'utf8').trimEnd() : process.env.NEXUS_PASSWORD;
++const req=require(secure?'node:https':'node:http').get({hostname:process.env.NEXUS_LISTEN==='::1'?'::1':'127.0.0.1',port,path:'/health',servername:url.hostname,auth:'commander:'+password,headers:{host:url.host}},r=>{r.resume();process.exitCode=r.statusCode===200?0:1;});
++req.setTimeout(4000,()=>req.destroy());
++req.on('error',()=>{process.exitCode=1;});
