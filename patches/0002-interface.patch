@@ -1,0 +1,240 @@
+From c01cc89d18957b027189212f103292d1d2676a65 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:30:59 -0800
+Subject: [PATCH] Manage inference endpoints during setup and in Settings and
+ select models per agent
+
+---
+ frontend/app/app.js           | 19 ++++++--
+ frontend/app/harness.js       |  1 +
+ frontend/app/modeldock.js     |  8 ++--
+ frontend/app/nexus-network.js | 81 +++++++++++++++++++++++++++++++++++
+ frontend/app/stationui.js     |  1 +
+ frontend/index.html           |  2 +
+ 6 files changed, 105 insertions(+), 7 deletions(-)
+ create mode 100644 frontend/app/nexus-network.js
+
+diff --git a/frontend/app/app.js b/frontend/app/app.js
+index 808e9c434..88c4c907f 100644
+--- a/frontend/app/app.js
++++ b/frontend/app/app.js
+@@ -889,18 +889,18 @@ const App = (() => {
+       'claude-cli': 'CLAUDE CODE',
+       custom: 'CUSTOM'
+     };
+-    return map[provider] || String(provider || 'openrouter').toUpperCase();
++    return map[provider] || SK.providers.registry.getProviderProfile(provider)?.label || String(provider || 'openrouter').toUpperCase();
+   }
+   function normalizeProviderId(provider) {
+     return SK.providers.registry.normalizeProviderId(provider || 'openrouter', '');
+   }
+   function providerNeedsKey(provider) {
+     const p = normalizeProviderId(provider);
+-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
++    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
+   }
+   function providerUsesKeyBox(provider) {
+     const p = normalizeProviderId(provider);
+-    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
++    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
+   }
+   function providerNeedsBaseUrl(provider) {
+     return normalizeProviderId(provider) === 'custom';
+@@ -1882,7 +1882,7 @@ const App = (() => {
+     // A LOCAL catalog is exactly what is installed. The seed slug ('llama3.1') is only a name Ollama resolves if that
+     // exact tag was pulled; prefilling it over a machine that has only qwen3:8b woke the agent on a model that does not
+     // exist and failed its first run. Default to an installed model instead — one Ollama says can call tools.
+-    if (p === 'ollama' && list.length && !list.some(m => m && m.id === defId)) {
++    if ((p === 'ollama' || p.startsWith('nexus-')) && list.length && !list.some(m => m && m.id === defId)) {
+       const usable = list.find(m => m && m.supportsTools !== false) || list[0];
+       if (usable && usable.id) defId = usable.id;
+     }
+@@ -3093,6 +3093,17 @@ const App = (() => {
+     el('in-name').onkeydown = enterWakes;
+     el('in-key').onkeydown = enterWakes;
+     wireModelField();   // #in-model is a search combobox over #model-pop; it owns its keydown (Enter picks a row, else WAKEs)
++    const networkPanel = el('genesis-network');
++    networkPanel.ontoggle = () => {
++      if (networkPanel.open && !networkPanel.querySelector('inference-network')) networkPanel.append(document.createElement('inference-network'));
++    };
++    networkPanel.chooseEndpoint = row => {
++      userPickedProvider = true;
++      el('in-model').value = row.model || row.models[0] || '';
++      selectProviderUI(row.id);
++      networkPanel.open = false;
++      window.OverseerSetup?.beginConnection();
++    };
+     // provider toggle + ChatGPT sign-in wiring; selectProviderUI() also loads the right model catalog.
+     // Clear the model on a real USER switch so the new provider's curated default (MODEL_PICKS[p][0]) fills
+     // instead of carrying a cross-provider slug (e.g. codex 'gpt-5.5' bleeding onto OpenRouter, which needs
+diff --git a/frontend/app/harness.js b/frontend/app/harness.js
+index 5a086dc00..140c33136 100644
+--- a/frontend/app/harness.js
++++ b/frontend/app/harness.js
+@@ -485,6 +485,7 @@ const Harness = (() => {
+         const r = await fetch('/api/providers', { cache: 'no-store', signal: ctl.signal });
+         if (!r.ok) throw new Error('station status unavailable');
+         const j = await r.json();
++        if (Array.isArray(j.network)) SK.providers.registry.setNetwork(j.network);
+         if (!readinessCache.accept(j.providers, ticket)) readinessCache.offline();
+       } catch (_) { readinessCache.offline(); }
+       finally {
+diff --git a/frontend/app/modeldock.js b/frontend/app/modeldock.js
+index 2260e53c2..dee0ae457 100644
+--- a/frontend/app/modeldock.js
++++ b/frontend/app/modeldock.js
+@@ -158,7 +158,7 @@ const ModelDock = (() => {
+   function providerLabel(p) {
+     p = normalizeProvider(p);
+     const map = { starnet: 'STARNET', codex: 'GPT / CODEX', grok: 'GROK OAUTH', kimi: 'KIMI OAUTH', openrouter: 'OPENROUTER', openai: 'OPENAI API', anthropic: 'ANTHROPIC', gemini: 'GEMINI', xai: 'XAI', groq: 'GROQ', mistral: 'MISTRAL', deepseek: 'DEEPSEEK', together: 'TOGETHER', fireworks: 'FIREWORKS', perplexity: 'PERPLEXITY', cerebras: 'CEREBRAS', ollama: 'OLLAMA', 'claude-cli': 'CLAUDE CODE', custom: 'CUSTOM' };
+-    return map[p] || String(p || 'openrouter').toUpperCase();
++    return map[p] || providerRegistry.getProviderProfile(p)?.label || String(p || 'openrouter').toUpperCase();
+   }
+   function normalizeProvider(p) {
+     return providerRegistry.normalizeProviderId(p || 'openrouter', '');
+@@ -554,6 +554,8 @@ const ModelDock = (() => {
+       // harness never confirmed exist.
+       list = (p === 'codex' ? CODEX_MODELS : p === 'anthropic' ? ANTHROPIC_MODELS : p === 'gemini' ? GEMINI_MODELS : HOSTED_FALLBACKS[p] || OPENROUTER_FALLBACK).map(m => { const item = asModel(m, p); item.fallback = true; return item; });
+     }
++    const manual = providerRegistry.getProviderProfile(p)?.manualModel;
++    if (manual && !list.some(m=>m.id===manual)) list.push(asModel({id:manual},p));
+     list = list.filter(isAgentModel);
+     list.sort((a, b) => {
+       if (p === 'openrouter') {
+@@ -576,7 +578,7 @@ const ModelDock = (() => {
+     loadTiers(!!force).then(() => { if (!loading && generation === fetchGeneration) renderList(); }).catch(() => {});
+     // 'starnet' first: a linked station's own credits are the most direct way to run, and its catalog is
+     // the whole managed lineup. providerEnabled() keeps it out of the list when no credits are configured.
+-    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'];
++    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'].concat(providerRegistry.providerIds().filter(id=>id.startsWith('nexus-')));
+     const active = provider();
+     if (ids.indexOf(active) < 0) ids.unshift(active);
+     const pending = ids.map(p => fetchProviderModels(p, force));
+@@ -1029,7 +1031,7 @@ const ModelDock = (() => {
+   async function computeCatalog(force, ensure) {
+     // #93: 'starnet' leads here exactly as in the dock — without it a per-agent picker offered managed credits only
+     // while the FOCUSED agent already ran on them. providerEnabled() drops it (empty list) when the station is unlinked.
+-    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'];
++    const ids = ['starnet', 'codex', 'grok', 'kimi', 'openrouter', 'openai', 'anthropic', 'gemini', 'xai', 'groq', 'mistral', 'deepseek', 'together', 'fireworks', 'perplexity', 'cerebras', 'ollama', 'claude-cli', 'custom'].concat(providerRegistry.providerIds().filter(id=>id.startsWith('nexus-')));
+     const active = provider();
+     if (ids.indexOf(active) < 0) ids.unshift(active);
+     const balance = refreshStarnetBalance().catch(() => {});
+diff --git a/frontend/app/nexus-network.js b/frontend/app/nexus-network.js
+new file mode 100644
+index 000000000..fbce3717b
+--- /dev/null
++++ b/frontend/app/nexus-network.js
+@@ -0,0 +1,81 @@
++'use strict';
++class InferenceNetwork extends HTMLElement {
++  connectedCallback() { this.refresh(); }
++  node(tag,text,parent=this) {
++    const el=document.createElement(tag);
++    el.textContent=text;
++    parent.append(el);
++    return el;
++  }
++  button(parent,label,action) {
++    const button=this.node('button',label,parent);
++    button.type='button'; button.className='bb sm'; button.onclick=action;
++  }
++  async refresh(payload) {
++    try {
++      const res=await fetch('/api/nexus/network',payload ? {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)} : {cache:'no-store'});
++      const rows=await res.json();
++      if (!res.ok) throw Error(rows.error || 'Network unavailable');
++      this.rows=rows;
++      SK.providers.registry.setNetwork(rows);
++      this.replaceChildren();
++      this.node('h4','Inference Network').className='ms-h';
++      this.button(this,'Add endpoint',()=>this.edit({}));
++      this.button(this,'Refresh',()=>this.refresh());
++      for (const r of rows) {
++        const box=this.node('section','');
++        this.node('strong',r.name,box);
++        const info=[r.enabled ? r.status : 'disabled',r.baseUrl,r.active+' active',r.queued+' queued',r.error];
++        if (Number.isFinite(r.latency)) info.push(r.latency+' ms');
++        if (Number.isFinite(r.speed)) info.push(r.speed.toFixed(1)+' output tokens/s (whole request)');
++        this.node('p',info.filter(Boolean).join(' · '),box);
++        this.node('p',r.models.join(', ') || r.model || 'No catalog yet',box);
++        const action=(name,extra={})=>this.refresh({action:name,id:r.id,rev:r.rev,...extra});
++        const setup=this.closest('#genesis-network');
++        if (setup && r.enabled) this.button(box,'Use this endpoint',()=>setup.chooseEndpoint(r));
++        this.button(box,'Test connection',()=>action('test'));
++        this.button(box,'Edit',()=>this.edit(r));
++        this.button(box,'Duplicate',()=>action('duplicate',{name:r.name+' copy'}));
++        this.button(box,r.enabled?'Disable':'Enable',()=>action('edit',{enabled:!r.enabled}));
++        this.button(box,'Delete',()=>{if(confirm('Delete '+r.name+'?')) action('delete');});
++      }
++    } catch(e) {this.node('p',e.message);}
++  }
++  edit(row) {
++    this.replaceChildren();
++    const form=this.node('form','');
++    const fields=[['name','Display name'],['baseUrl','API base URL including /v1'],['key','API key (blank keeps current key on same URL)'],
++      ['auth','Authentication',['bearer','x-api-key']],['protocol','Protocol',['openai','ollama']],['model','Manual model ID'],
++      ['context','Context window',0],['output','Maximum output tokens',0],['timeout','Timeout in milliseconds',120000],
++      ['concurrency','Maximum concurrent requests',1],['priority','Priority',0],['tools','Tool calling',['unknown','yes','no']],
++      ['vision','Vision',['unknown','yes','no']],['mode','Routing',['manual','priority','balance','failover','local']]];
++    for (const [name,label,options] of fields) {
++      const line=this.node('label',label+' ',this.node('p','',form));
++      const input=this.node(Array.isArray(options)?'select':'input','',line);
++      input.name=name;
++      if (Array.isArray(options)) {
++        for(const value of options) this.node('option',value,input);
++        input.value=typeof row[name]==='boolean'?(row[name]?'yes':'no'):row[name] || options[0];
++      } else {
++        input.type=name==='key'?'password':typeof options==='number'?'number':'text';
++        input.value=row[name] ?? options ?? '';
++      }
++    }
++    this.node('p','Authorized alternatives',form);
++    for(const r of this.rows.filter(r=>r.id!==row.id)) {
++      const input=this.node('input','',this.node('label',r.name+' ',form));
++      input.type='checkbox';input.name='alternate';input.value=r.id;
++      input.checked=row.alternatives?.includes(r.id) || false;
++    }
++    this.node('button','Save endpoint',form).className='bb sm';
++    this.button(form,'Cancel',()=>this.refresh());
++    form.onsubmit=event=>{
++      event.preventDefault();
++      const data=new FormData(form), values=Object.fromEntries(data);
++      if(!values.key) delete values.key;
++      for(const field of ['tools','vision']) values[field]=values[field]==='unknown'?null:values[field]==='yes';
++      this.refresh({...values,alternatives:data.getAll('alternate'),action:row.id?'edit':'add',id:row.id,rev:row.rev});
++    };
++  }
++}
++customElements.define('inference-network',InferenceNetwork);
+diff --git a/frontend/app/stationui.js b/frontend/app/stationui.js
+index a7c895749..0ef58a0d8 100644
+--- a/frontend/app/stationui.js
++++ b/frontend/app/stationui.js
+@@ -8155,6 +8155,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
+     // settings test source-locks them). mountConsole builds these panes once and returns a content host
+     // that spans them all, so the wireX calls below reach every control with no per-section rewire.
+     const secProviders = () =>
++      '<inference-network></inference-network>' +
+       // NB: no inner "PROVIDERS" heading — the console section head already prints PROVIDERS above the pane
+       // (a second identical h4 read as a duplicated title in sys-settings.png).
+       '<div class="prov-list">' + providersHtml() + '</div>' +
+diff --git a/frontend/index.html b/frontend/index.html
+index 628b25827..c47ad45fa 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -193,6 +193,7 @@
+           <!-- BEGINNER FUNNEL: lead with the no-API-key path. A ChatGPT Plus/Pro login (Codex OAuth) needs
+                no key at all, so it's the recommended default and sits first; BYOK (OpenRouter etc.) stays a
+                fully visible one-click alternative for anyone who already has a key. -->
++          <details id="genesis-network"><summary>Inference Network</summary></details>
+           <div class="ov-brain">
+             <!-- TWO-TIER PROVIDER PICK: the no-API-key ChatGPT path is the ONLY hero card (recommended, sits
+                  alone up top); everything else — including the other keyless OAuth sign-ins (grok/kimi) — is a
+@@ -852,6 +853,7 @@
+ <script src="app/skin-study-tone.js"></script><script src="app/skin-study-preview.js"></script>
+ <script src="js/assets.js"></script>
+ <script src="app/runoutcome.js"></script><!-- TYPED OUTCOMES: how a run ended, as ONE code (the sidecar requires the same module) — before harness.js, which resolves an older station's ending through it -->
++<script src="app/nexus-network.js"></script>
+ <script src="app/provider-registry.js"></script><!-- generated from the sidecar's provider registry -->
+ <script src="app/provider-readiness.js"></script>
+ <script src="app/harness.js"></script>
