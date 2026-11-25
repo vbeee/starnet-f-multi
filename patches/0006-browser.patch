@@ -1,0 +1,406 @@
+From 0acfa3363b05d826f98d35b9131417779e2d5ed5 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:49:13 -0800
+Subject: [PATCH] Recover a shared browser station, verify remote access and
+ pin workload routing
+
+---
+ frontend/app/app.js               |  4 +-
+ frontend/app/cloudsave.js         |  2 +-
+ frontend/app/harness.js           |  4 +-
+ frontend/app/overseer-setup.js    |  6 ++-
+ sidecar/index.js                  |  4 +-
+ sidecar/nexus-network.js          | 17 +++---
+ test/helpers/nexus-loopback.cjs   |  8 +++
+ test/nexus-browser.py             | 90 +++++++++++++++++++++++++++++++
+ test/nexus-server.test.js         | 20 ++++++-
+ website/app/app/app.js            |  4 +-
+ website/app/app/cloudsave.js      |  2 +-
+ website/app/app/harness.js        |  4 +-
+ website/app/app/overseer-setup.js |  6 ++-
+ 13 files changed, 146 insertions(+), 25 deletions(-)
+ create mode 100644 test/helpers/nexus-loopback.cjs
+ create mode 100644 test/nexus-browser.py
+
+diff --git a/frontend/app/app.js b/frontend/app/app.js
+index 88c4c907f..8ad98654c 100644
+--- a/frontend/app/app.js
++++ b/frontend/app/app.js
+@@ -896,11 +896,11 @@ const App = (() => {
+   }
+   function providerNeedsKey(provider) {
+     const p = normalizeProviderId(provider);
+-    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
++    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli' && !p.startsWith('nexus-');
+   }
+   function providerUsesKeyBox(provider) {
+     const p = normalizeProviderId(provider);
+-    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
++    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli' && !p.startsWith('nexus-');
+   }
+   function providerNeedsBaseUrl(provider) {
+     return normalizeProviderId(provider) === 'custom';
+diff --git a/frontend/app/cloudsave.js b/frontend/app/cloudsave.js
+index ec6a9d4b7..e5c99c2c4 100644
+--- a/frontend/app/cloudsave.js
++++ b/frontend/app/cloudsave.js
+@@ -634,7 +634,7 @@ const CloudSave = (() => {
+       }
+     } catch (_) {}
+     let ctl = null, t = null;
+-    try { ctl = new AbortController(); t = setTimeout(() => { try { ctl.abort(); } catch (_) {} }, 2500); } catch (_) {}
++    try { ctl = new AbortController(); t = setTimeout(() => { try { ctl.abort(); } catch (_) {} }, globalThis.__NEXUS_SERVER__ ? 15000 : 2500); } catch (_) {}
+     return fetch(ENDPOINT + '?agent=' + encodeURIComponent(AGENT_ID), { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
+       .then(async r => {
+         if (!r.ok) {
+diff --git a/frontend/app/harness.js b/frontend/app/harness.js
+index 7474b6a7e..bb34e66cd 100644
+--- a/frontend/app/harness.js
++++ b/frontend/app/harness.js
+@@ -1443,8 +1443,8 @@ const Harness = (() => {
+       // available when the STATION has the required shared gear (a specialist owns only a desk yet still gets its
+       // class skills). Sent separately so the tool projection is untouched; the sidecar uses it for skills only.
+       if (Array.isArray(stationPlaced) && stationPlaced.length) reqBody.stationPlaced = stationPlaced;
+-      if (!DESKTOP && !DEVMODE && provider !== 'codex' && provider !== 'grok' && provider !== 'kimi') reqBody.key = key;   // dev/desktop + the OAuth providers keep secrets server-side (custom/ollama may still ride an optional key)
+-      if (!DESKTOP && !DEVMODE) {
++      if (!globalThis.__NEXUS_SERVER__ && !DESKTOP && !DEVMODE && provider !== 'codex' && provider !== 'grok' && provider !== 'kimi') reqBody.key = key;   // dev/desktop + the OAuth providers keep secrets server-side (custom/ollama may still ride an optional key)
++      if (!globalThis.__NEXUS_SERVER__ && !DESKTOP && !DEVMODE) {
+         try { const pool = JSON.parse(readScoped(LS.keyPool, provider) || '[]'); if (Array.isArray(pool) && pool.length) reqBody.keyPool = pool; } catch (_) {}
+       }
+       // ONE STREAM PER PAGE: the run's lines ride the page's shared stream, so this POST does not hold a connection for the
+diff --git a/frontend/app/overseer-setup.js b/frontend/app/overseer-setup.js
+index bc739da26..7277145d0 100644
+--- a/frontend/app/overseer-setup.js
++++ b/frontend/app/overseer-setup.js
+@@ -13,10 +13,12 @@ window.OverseerSetup = (() => {
+     custom: ['Custom','Your endpoint'], 'claude-cli': ['Claude Code','Your Claude subscription']
+   };
+   function reflectProvider(provider) {
++    const endpoint = provider.startsWith('nexus-') && window.SK?.providers?.registry?.getProviderProfile(provider);
+     const title = el('ov-connection-title');
+-    if (title) title.textContent = provider === 'starnet' ? 'Your StarNet account' : (providers[provider]?.[0] || 'Provider');
++    if (title) title.textContent = provider === 'starnet' ? 'Your StarNet account' : (endpoint?.name || providers[provider]?.[0] || 'Provider');
+     const help = el('ov-connection-help');
+     if (help) help.textContent = provider === 'starnet' ? 'Confirm your account in the browser, then choose a model.'
++      : endpoint ? 'Choose a model from this inference endpoint.'
+       : provider === 'ollama' ? 'Choose a model installed on this computer.'
+       : provider === 'claude-cli' ? 'Sign in with your Claude subscription, then choose a model.'
+       : provider === 'custom' ? 'Enter your endpoint, then choose or enter a model ID.'
+@@ -26,7 +28,7 @@ window.OverseerSetup = (() => {
+     const logo = el('ov-connection-logo');
+     if (logo) {
+       logo.classList.toggle('ov-starnet-logo', provider === 'starnet');
+-      logo.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/' + (provider === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (provider === 'codex' ? 'openai' : provider) + '.svg'), document.baseURI).href + '")');
++      logo.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/' + (provider === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (endpoint ? 'custom' : provider === 'codex' ? 'openai' : provider) + '.svg'), document.baseURI).href + '")');
+     }
+   }
+   function beginConnection() {
+diff --git a/sidecar/index.js b/sidecar/index.js
+index 4189ddcba..248ec18bb 100644
+--- a/sidecar/index.js
++++ b/sidecar/index.js
+@@ -1198,7 +1198,7 @@ const engineKeys = engineCredential.makeEngineKeys({
+ const DESKTOP_ENDPOINTS_FILE = path.join(WORKSPACES, '.secrets', 'provider-endpoints.json');
+ const CHANNEL_CREDENTIALS_FILE = path.join(WORKSPACES, '.secrets', 'channel-credentials.json');
+ const SHELL_PUSHES_PROVIDER_CONFIG = !!String(ENV('IPC_TOKEN') || '').trim();
+-const nexus = require('./nexus-network').networkStore(WORKSPACES, require('./providers/registry').setNetwork);
++const nexus = require('./nexus-network').networkStore(WORKSPACES, require('./providers/registry').setNetwork, () => performance.now());
+ require('./providers/factory').attachNetwork(nexus);
+ const PROVIDER_IDS = Object.freeze(listProviderProfiles({ includeInactive: true, public: false }).map(p => p.id));   // the registry's, fixed
+ const credStore = credentialStore.makeCredentialStore({
+@@ -24292,7 +24292,7 @@ async function runOnceCore(o) {
+   // default when nothing is saved. On overload/5xx/404/auth/billing/rate_limit the loop retries the turn on the
+   // next model instead of dying (errorClass shouldFallback/shouldRotateCredential). Empty = off.
+   // a saved chain names OpenRouter routes (see above): its batch-only ids run on their base models, like the primary's
+-  const fallbackModels = (Array.isArray(o.fallbackModels) ? o.fallbackModels : effectiveFallbackChain())
++  const fallbackModels = providerId.startsWith('nexus-') ? [] : (Array.isArray(o.fallbackModels) ? o.fallbackModels : effectiveFallbackChain())
+     .map(s => chatModelId(Array.isArray(o.fallbackModels) || fallbackSaved == null ? providerId : 'openrouter', String(s || '').trim())).filter(Boolean);
+   const savedProviderFallbacks = !Array.isArray(o.fallbackModels) && fallbackSaved != null && providerId !== 'openrouter' && providerId !== 'starnet'
+     ? fallbackModels.splice(0).map(m => ({ provider: 'openrouter', model: m })) : [];
+diff --git a/sidecar/nexus-network.js b/sidecar/nexus-network.js
+index a250ce2bc..bfe29ea16 100644
+--- a/sidecar/nexus-network.js
++++ b/sidecar/nexus-network.js
+@@ -11,7 +11,7 @@ function privateTarget(url) {
+   return host.ip && !host.embedded && ['private','loopback','unique-local','cgnat'].includes(host.kind);
+ }
+ 
+-function networkStore(root, publish) {
++function networkStore(root, publish, now) {
+   const file = path.join(root,'.secrets','inference-network.json');
+   let saved = { rows: [], imported: false };
+   try { saved = JSON.parse(fs.readFileSync(file,'utf8')); }
+@@ -84,7 +84,7 @@ function networkStore(root, publish) {
+   async function probe(id) {
+     const row = rows.get(id);
+     if (!row?.enabled) throw Error('Endpoint unavailable');
+-    const s = state(id), start = performance.now();
++    const s = state(id), start = now();
+     try {
+       const res = await transport(row,fetch)(row.baseUrl+'/models',{signal:AbortSignal.timeout(Math.min(row.timeout,8000))});
+       if (!res.ok) throw Error('HTTP '+res.status);
+@@ -94,7 +94,7 @@ function networkStore(root, publish) {
+     } catch (e) {
+       if (row === rows.get(id)) Object.assign(s,{status:'offline',error:/^HTTP \d+$/.test(e.message) ? e.message : 'Discovery failed',models:[],windows:{}});
+     }
+-    if (row === rows.get(id)) s.latency = Math.round(performance.now()-start);
++    if (row === rows.get(id)) s.latency = Math.round(now()-start);
+     return s;
+   }
+   function direct(row,opts,build) {
+@@ -111,12 +111,12 @@ function networkStore(root, publish) {
+             s.waiting.push(wake); req.signal?.addEventListener('abort',cancel,{once:true});
+           });
+         }
+-        const start = performance.now();
++        const start = now();
+         s.active++;
+         try {
+           for await (const event of base.stream(req)) {
+             const tokens = event.usage?.completion_tokens;
+-            if (event.type === 'usage' && Number.isFinite(tokens)) s.speed = tokens*1000/Math.max(1,performance.now()-start);
++            if (event.type === 'usage' && Number.isFinite(tokens)) s.speed = tokens*1000/Math.max(1,now()-start);
+             yield event;
+           }
+           if (row === rows.get(row.id)) { s.status='online'; s.error=''; }
+@@ -133,10 +133,13 @@ function networkStore(root, publish) {
+     if (primary.mode === 'manual') return base;
+     let choice;
+     async function select(req) {
++      const needsVision = primary.vision === true || (req.messages || []).some(message =>
++        Array.isArray(message.content) && message.content.some(part => ['image','image_url','input_image'].includes(part?.type)));
+       const choices = [primary,...primary.alternatives.map(id=>rows.get(id))].filter(r=>r?.enabled &&
+         (primary.mode !== 'local' || privateTarget(r.baseUrl)) && (r === primary || ((!req.tools?.length || r.tools === true) &&
+-        (primary.vision !== true || r.vision === true) && r.context >= primary.context && r.output >= primary.output)));
+-      if (primary.mode === 'priority') choices.sort((a,b)=>b.priority-a.priority);
++        (!needsVision || r.vision === true) && r.context >= primary.context && r.output >= primary.output)));
++      if (primary.mode === 'priority') choices.sort((a,b)=>
++        Number(state(a.id).active >= a.concurrency)-Number(state(b.id).active >= b.concurrency) || b.priority-a.priority);
+       if (primary.mode === 'balance' && choices.length) {
+         choices.push(...choices.splice(0,cursor++ % choices.length));
+         const load = r => (state(r.id).active+state(r.id).waiting.length)/r.concurrency;
+diff --git a/test/helpers/nexus-loopback.cjs b/test/helpers/nexus-loopback.cjs
+new file mode 100644
+index 000000000..e88c50852
+--- /dev/null
++++ b/test/helpers/nexus-loopback.cjs
+@@ -0,0 +1,8 @@
++// The browser fixture runs a real station but owns only two loopback HTTP servers.
++const net=require('node:net');
++const original=net.Socket.prototype.connect;
++net.Socket.prototype.connect=function(...args) {
++  const options=Array.isArray(args[0]) ? args[0][0] : net._normalizeArgs(args)[0];
++  if (options.path || !['127.0.0.1','::1','localhost'].includes(options.host || 'localhost')) throw Error('Fixture only permits loopback');
++  return original.apply(this,args);
++};
+diff --git a/test/nexus-browser.py b/test/nexus-browser.py
+new file mode 100644
+index 000000000..87604276a
+--- /dev/null
++++ b/test/nexus-browser.py
+@@ -0,0 +1,90 @@
++"""Run with Python Playwright and NEXUS_CHROMIUM pointing to a Chromium executable."""
++import json
++import os
++import secrets
++import socket
++import subprocess
++import tempfile
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from urllib.request import urlopen
++from urllib.error import HTTPError, URLError
++from playwright.sync_api import sync_playwright
++
++class Catalog(BaseHTTPRequestHandler):
++    def do_GET(self):
++        self.send_response(200)
++        self.send_header('Content-Type', 'application/json')
++        self.end_headers()
++        self.wfile.write(json.dumps({'data': [{'id': 'nexus-demo'}]}).encode())
++    def do_POST(self):
++        if self.path!='/v1/chat/completions':
++            self.send_error(404)
++            return
++        self.rfile.read(int(self.headers.get('content-length','0')))
++        self.send_response(200)
++        self.send_header('Content-Type','text/event-stream')
++        self.end_headers()
++        for choice in [{'delta':{'content':'OK'}},{'delta':{},'finish_reason':'stop'}]:
++            self.wfile.write(('data: '+json.dumps({'choices':[choice]})+'\n\n').encode())
++        self.wfile.write(b'data: [DONE]\n\n')
++    def log_message(self, *args):
++        pass
++
++mock = ThreadingHTTPServer(('127.0.0.1', 0), Catalog)
++threading.Thread(target=mock.serve_forever, daemon=True).start()
++with socket.socket() as reservation:
++    reservation.bind(('127.0.0.1', 0))
++    port = reservation.getsockname()[1]
++base = f'http://127.0.0.1:{port}'
++password = secrets.token_urlsafe(32)
++with tempfile.TemporaryDirectory() as data:
++    server = subprocess.Popen(['node', '--require', './test/helpers/nexus-loopback.cjs', 'scripts/nexus-server.js'], env=dict(PATH=os.environ['PATH'], HOME=data, NEXUS_PORT=str(port),
++        NEXUS_PASSWORD=password, NEXUS_DATA_DIR=data, NEXUS_PUBLIC_URL=base), stdout=subprocess.DEVNULL)
++    try:
++        for attempt in range(100):
++            try:
++                urlopen(base)
++            except HTTPError as error:
++                assert error.code == 401
++                break
++            except URLError:
++                time.sleep(.1)
++        with sync_playwright() as pw:
++            browser = pw.chromium.launch(executable_path=os.environ.get('NEXUS_CHROMIUM'),args=['--no-sandbox','--disable-dev-shm-usage','--no-zygote','--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader'])
++            def new_page():
++                context = browser.new_context(viewport={'width':900,'height':650},reduced_motion='reduce',http_credentials={'username': 'commander', 'password': password})
++                context.route('**/*', lambda route: route.continue_() if route.request.url.startswith(base + '/') else route.abort())
++                return context.new_page()
++            first, second = new_page(), new_page()
++            first.goto(base,wait_until='domcontentloaded')
++            first.get_by_text('PRESS ANY KEY TO START',exact=False).click()
++            first.locator('#in-name').fill('Nova')
++            first.locator('#btn-setup-next').click()
++            first.locator('#genesis-network summary').click()
++            panel = first.locator('#genesis-network inference-network')
++            panel.get_by_text('Add endpoint',exact=True).click()
++            panel.locator('[name=name]').fill('Local test machine')
++            panel.locator('[name=baseUrl]').fill(f'http://127.0.0.1:{mock.server_port}/v1')
++            panel.locator('[name=model]').fill('nexus-demo')
++            panel.get_by_text('Save endpoint').click()
++            panel.get_by_text('Test connection').click()
++            panel.get_by_text('Use this endpoint').click()
++            first.locator('#btn-wake').click()
++            for _ in range(100):
++                snapshot=first.evaluate("""async()=>{const r=await fetch('/api/save?agent=agent',{headers:{'X-StarNet-Token':window.__STARNET_API_TOKEN__}});let b=await r.json();return [r.status,b.error,b.save?.agent?.model,b.save?.agent?.name]}""")
++                if snapshot[2]=='nexus-demo': break
++                first.wait_for_timeout(200)
++            assert snapshot[2]=='nexus-demo', (snapshot,first.locator('body').inner_text()[-2600:])
++            second.goto(base,wait_until='domcontentloaded')
++            first.context.close()
++            second.wait_for_function("() => typeof Save!=='undefined' && Save.load()?.agent?.name==='NOVA'",timeout=45000)
++            assert second.evaluate("Save.load().agent.model")=='nexus-demo'
++            second.get_by_text('COMMS · General',exact=False).first.wait_for(timeout=45000)
++            browser.close()
++            print('PASS: two isolated browser contexts resumed the same station after endpoint onboarding')
++    finally:
++        server.terminate()
++        server.wait(timeout=15)
++        mock.shutdown()
+diff --git a/test/nexus-server.test.js b/test/nexus-server.test.js
+index 4f8621efe..8888d847b 100644
+--- a/test/nexus-server.test.js
++++ b/test/nexus-server.test.js
+@@ -15,7 +15,7 @@ function temp(t) {
+ }
+ async function listen(server) { server.listen(0,'127.0.0.1'); await once(server,'listening'); return server.address().port; }
+ test('100 endpoints, revisions, migration, private persistence and restart',t=>{
+-  const dir=temp(t), open=()=>networkStore(dir,()=>{}), store=open();
++  const dir=temp(t), open=()=>networkStore(dir,()=>{},()=>performance.now()), store=open();
+   for(let i=0;i<100;i++) store.save('add',{name:'server '+i,baseUrl:'http://127.0.0.1:9000/v1',key:'fixture-secret'});
+   const rows=store.list(); assert.equal(new Set(rows.map(r=>r.id)).size,100);
+   assert.ok(!JSON.stringify(rows).includes('fixture-secret'));
+@@ -77,7 +77,7 @@ test('authenticated station routes overlapping crew runs to independent servers,
+ });
+ test('authorized failover preserves streamed tool arguments, credential origin and context ceiling',async t=>{
+   const root=temp(t), registry=require('../sidecar/providers/registry'),factory=require('../sidecar/providers/factory');
+-  const store=networkStore(root,registry.setNetwork);factory.attachNetwork(store);
++  const store=networkStore(root,registry.setNetwork,()=>performance.now());factory.attachNetwork(store);
+   let available=false,requests=0;
+   const server=http.createServer(async(req,res)=>{
+     if(req.url==='/v1/models') {res.setHeader('content-type','application/json');return res.end(JSON.stringify({data:[{id:'same',context_length:8192}]}));}
+@@ -100,3 +100,19 @@ test('authorized failover preserves streamed tool arguments, credential origin a
+   assert.equal(requests,1);assert.equal(store.list()[0].windows.same,8192);
+   assert.equal(store.list().at(-1).status,'offline');available=true;assert.equal((await store.probe(primary.id)).status,'online');
+ });
++test('redirects never acquire credentials and local-only routing rejects public servers',async t=>{
++  const store=networkStore(temp(t),()=>{},()=>performance.now()); let hits=0;
++  const other=http.createServer((req,res)=>{hits++;res.end('no');});
++  t.after(()=>other.close());const next='http://127.0.0.1:'+await listen(other)+'/sink';
++  const redirect=http.createServer((req,res)=>{res.writeHead(307,{location:next});res.end();});
++  t.after(()=>redirect.close());const local='http://127.0.0.1:'+await listen(redirect)+'/v1';
++  const row=store.save('add',{name:'redirect fixture',baseUrl:local,key:'private',mode:'local'})[0];
++  assert.equal((await store.probe(row.id)).status,'offline');assert.equal(hits,0);
++  assert.throws(()=>store.save('add',{mode:'local',name:'public',baseUrl:'https://example.org/v1'}),/private IP/);
++});
++test('TLS required for a network listener and HTTPS required for a remote origin',()=>{
++  const {configure}=require('../sidecar/nexus-access');
++  const password='test-only-password-of-sufficient-length';
++  assert.throws(()=>configure({NEXUS_PASSWORD:password,NEXUS_LISTEN:'0.0.0.0'},8787),/require a TLS/);
++  assert.throws(()=>configure({NEXUS_PASSWORD:password,NEXUS_PUBLIC_URL:'http://station.lan'},8787),/require HTTPS/);
++});
+diff --git a/website/app/app/app.js b/website/app/app/app.js
+index 88c4c907f..8ad98654c 100644
+--- a/website/app/app/app.js
++++ b/website/app/app/app.js
+@@ -896,11 +896,11 @@ const App = (() => {
+   }
+   function providerNeedsKey(provider) {
+     const p = normalizeProviderId(provider);
+-    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli';
++    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'custom' && p !== 'starnet' && p !== 'claude-cli' && !p.startsWith('nexus-');
+   }
+   function providerUsesKeyBox(provider) {
+     const p = normalizeProviderId(provider);
+-    return !p.startsWith('nexus-') && p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli';
++    return p !== 'codex' && p !== 'grok' && p !== 'kimi' && p !== 'ollama' && p !== 'starnet' && p !== 'claude-cli' && !p.startsWith('nexus-');
+   }
+   function providerNeedsBaseUrl(provider) {
+     return normalizeProviderId(provider) === 'custom';
+diff --git a/website/app/app/cloudsave.js b/website/app/app/cloudsave.js
+index ec6a9d4b7..e5c99c2c4 100644
+--- a/website/app/app/cloudsave.js
++++ b/website/app/app/cloudsave.js
+@@ -634,7 +634,7 @@ const CloudSave = (() => {
+       }
+     } catch (_) {}
+     let ctl = null, t = null;
+-    try { ctl = new AbortController(); t = setTimeout(() => { try { ctl.abort(); } catch (_) {} }, 2500); } catch (_) {}
++    try { ctl = new AbortController(); t = setTimeout(() => { try { ctl.abort(); } catch (_) {} }, globalThis.__NEXUS_SERVER__ ? 15000 : 2500); } catch (_) {}
+     return fetch(ENDPOINT + '?agent=' + encodeURIComponent(AGENT_ID), { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
+       .then(async r => {
+         if (!r.ok) {
+diff --git a/website/app/app/harness.js b/website/app/app/harness.js
+index 7474b6a7e..bb34e66cd 100644
+--- a/website/app/app/harness.js
++++ b/website/app/app/harness.js
+@@ -1443,8 +1443,8 @@ const Harness = (() => {
+       // available when the STATION has the required shared gear (a specialist owns only a desk yet still gets its
+       // class skills). Sent separately so the tool projection is untouched; the sidecar uses it for skills only.
+       if (Array.isArray(stationPlaced) && stationPlaced.length) reqBody.stationPlaced = stationPlaced;
+-      if (!DESKTOP && !DEVMODE && provider !== 'codex' && provider !== 'grok' && provider !== 'kimi') reqBody.key = key;   // dev/desktop + the OAuth providers keep secrets server-side (custom/ollama may still ride an optional key)
+-      if (!DESKTOP && !DEVMODE) {
++      if (!globalThis.__NEXUS_SERVER__ && !DESKTOP && !DEVMODE && provider !== 'codex' && provider !== 'grok' && provider !== 'kimi') reqBody.key = key;   // dev/desktop + the OAuth providers keep secrets server-side (custom/ollama may still ride an optional key)
++      if (!globalThis.__NEXUS_SERVER__ && !DESKTOP && !DEVMODE) {
+         try { const pool = JSON.parse(readScoped(LS.keyPool, provider) || '[]'); if (Array.isArray(pool) && pool.length) reqBody.keyPool = pool; } catch (_) {}
+       }
+       // ONE STREAM PER PAGE: the run's lines ride the page's shared stream, so this POST does not hold a connection for the
+diff --git a/website/app/app/overseer-setup.js b/website/app/app/overseer-setup.js
+index bc739da26..7277145d0 100644
+--- a/website/app/app/overseer-setup.js
++++ b/website/app/app/overseer-setup.js
+@@ -13,10 +13,12 @@ window.OverseerSetup = (() => {
+     custom: ['Custom','Your endpoint'], 'claude-cli': ['Claude Code','Your Claude subscription']
+   };
+   function reflectProvider(provider) {
++    const endpoint = provider.startsWith('nexus-') && window.SK?.providers?.registry?.getProviderProfile(provider);
+     const title = el('ov-connection-title');
+-    if (title) title.textContent = provider === 'starnet' ? 'Your StarNet account' : (providers[provider]?.[0] || 'Provider');
++    if (title) title.textContent = provider === 'starnet' ? 'Your StarNet account' : (endpoint?.name || providers[provider]?.[0] || 'Provider');
+     const help = el('ov-connection-help');
+     if (help) help.textContent = provider === 'starnet' ? 'Confirm your account in the browser, then choose a model.'
++      : endpoint ? 'Choose a model from this inference endpoint.'
+       : provider === 'ollama' ? 'Choose a model installed on this computer.'
+       : provider === 'claude-cli' ? 'Sign in with your Claude subscription, then choose a model.'
+       : provider === 'custom' ? 'Enter your endpoint, then choose or enter a model ID.'
+@@ -26,7 +28,7 @@ window.OverseerSetup = (() => {
+     const logo = el('ov-connection-logo');
+     if (logo) {
+       logo.classList.toggle('ov-starnet-logo', provider === 'starnet');
+-      logo.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/' + (provider === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (provider === 'codex' ? 'openai' : provider) + '.svg'), document.baseURI).href + '")');
++      logo.style.setProperty('--provider-icon', 'url("' + new URL('assets/brand/' + (provider === 'starnet' ? 'starnet-wordmark.svg' : 'providers/' + (endpoint ? 'custom' : provider === 'codex' ? 'openai' : provider) + '.svg'), document.baseURI).href + '")');
+     }
+   }
+   function beginConnection() {
