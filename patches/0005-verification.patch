@@ -1,0 +1,361 @@
+From 3e3e4eac8f9f65359f69c97e6fccdd22e2583a8a Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:42:01 -0800
+Subject: [PATCH] Verify routing, isolate endpoint credentials and report
+ measured model windows
+
+---
+ frontend/app/nexus-network.js             |  11 ++-
+ sidecar/index.js                          |   8 +-
+ sidecar/nexus-access.js                   |   7 +-
+ sidecar/nexus-network.js                  |  20 +++--
+ test/credential-store.no-crossing.test.js |   1 +
+ test/helpers/credential-store-sandbox.js  |   4 +-
+ test/nexus-server.test.js                 | 102 ++++++++++++++++++++++
+ test/update-drain-wiring.test.js          |   2 +-
+ website/app/app/nexus-network.js          |  11 ++-
+ 9 files changed, 148 insertions(+), 18 deletions(-)
+ create mode 100644 test/nexus-server.test.js
+
+diff --git a/frontend/app/nexus-network.js b/frontend/app/nexus-network.js
+index fbce3717b..21a1385bd 100644
+--- a/frontend/app/nexus-network.js
++++ b/frontend/app/nexus-network.js
+@@ -29,7 +29,10 @@ class InferenceNetwork extends HTMLElement {
+         if (Number.isFinite(r.latency)) info.push(r.latency+' ms');
+         if (Number.isFinite(r.speed)) info.push(r.speed.toFixed(1)+' output tokens/s (whole request)');
+         this.node('p',info.filter(Boolean).join(' · '),box);
+-        this.node('p',r.models.join(', ') || r.model || 'No catalog yet',box);
++        this.node('p',r.models.map(id=>id+(r.windows?.[id]?' ('+r.windows[id]+' context)':'')).join(', ') || r.model || 'No catalog yet',box);
++        const limits = [r.context && 'Context '+r.context,r.output && 'Output '+r.output];
++        for (const [field,label] of [['tools','Tools'],['vision','Vision']]) if (typeof r[field]==='boolean') limits.push(label+' '+(r[field]?'enabled':'disabled'));
++        if (limits.some(Boolean)) this.node('p',limits.filter(Boolean).join(' · '),box);
+         const action=(name,extra={})=>this.refresh({action:name,id:r.id,rev:r.rev,...extra});
+         const setup=this.closest('#genesis-network');
+         if (setup && r.enabled) this.button(box,'Use this endpoint',()=>setup.chooseEndpoint(r));
+@@ -61,6 +64,10 @@ class InferenceNetwork extends HTMLElement {
+         input.value=row[name] ?? options ?? '';
+       }
+     }
++    if (row.hasKey) {
++      const clear=this.node('input','',this.node('label','Remove stored API key ',form));
++      clear.name='clearKey'; clear.type='checkbox';
++    }
+     this.node('p','Authorized alternatives',form);
+     for(const r of this.rows.filter(r=>r.id!==row.id)) {
+       const input=this.node('input','',this.node('label',r.name+' ',form));
+@@ -72,7 +79,7 @@ class InferenceNetwork extends HTMLElement {
+     form.onsubmit=event=>{
+       event.preventDefault();
+       const data=new FormData(form), values=Object.fromEntries(data);
+-      if(!values.key) delete values.key;
++      if(values.clearKey) values.key=''; else if(!values.key) delete values.key;
+       for(const field of ['tools','vision']) values[field]=values[field]==='unknown'?null:values[field]==='yes';
+       this.refresh({...values,alternatives:data.getAll('alternate'),action:row.id?'edit':'add',id:row.id,rev:row.rev});
+     };
+diff --git a/sidecar/index.js b/sidecar/index.js
+index 9bca727c1..4189ddcba 100644
+--- a/sidecar/index.js
++++ b/sidecar/index.js
+@@ -13469,6 +13469,7 @@ const ROUTES = [
+       const {action,...input} = JSON.parse(await readBody(req,65536,res));
+       if (action === 'test') await nexus.probe(input.id);
+       else {
++        if (input.baseUrl && credStore.urlSecretParts(input.baseUrl).length) throw Error('Put credentials in the API key field');
+         const result = nexus.save(action,input);
+         if (action === 'add' && result.at(-1).enabled) await nexus.probe(result.at(-1).id);
+       }
+@@ -13828,7 +13829,12 @@ server.on('error', (e) => {
+ });
+ function importNexusCustom() {
+   if (DESKTOP_SHELL) return;
+-  try { nexus.migrate(providerRuntimeKey('custom',''),providerRuntimeBaseUrl('custom','')); }
++  try {
++    const url = providerRuntimeBaseUrl('custom','');
++    if (credStore.urlSecretParts(url).length) return; // Legacy path credentials remain in their protected singleton.
++    const key = providerRuntimeKey('custom','');
++    nexus.migrate(key,url,credStore.secretValues().includes(key));
++  }
+   catch (_) { console.warn('[nexus] Custom import unavailable. Existing configuration retained.'); }
+ }
+ importNexusCustom();
+diff --git a/sidecar/nexus-access.js b/sidecar/nexus-access.js
+index 55012f197..60a5d695d 100644
+--- a/sidecar/nexus-access.js
++++ b/sidecar/nexus-access.js
+@@ -25,9 +25,10 @@ function configure(env, port) {
+       return false;
+     }
+     if (!hosts.has(req.headers.host) || req.headers.origin && !origins.has(req.headers.origin) || req.headers['sec-fetch-site']==='cross-site') return reject(403);
+-    if (!crypto.timingSafeEqual(expected,digest(req.headers.authorization || ''))) return reject(401);
+-    if (!['GET','HEAD','OPTIONS'].includes(req.method) && !req.headers.origin && !req.headers['x-starnet-token']) return reject(403);
+-    delete req.headers.authorization;
++    const externalAPI = /^\/v1(?:\/|\?|$)/.test(req.url) && /^Bearer /i.test(req.headers.authorization || '');
++    if (!externalAPI && !crypto.timingSafeEqual(expected,digest(req.headers.authorization || ''))) return reject(401);
++    if (!externalAPI && !['GET','HEAD','OPTIONS'].includes(req.method) && !req.headers.origin && !req.headers['x-starnet-token']) return reject(403);
++    if (!externalAPI) delete req.headers.authorization;
+     req.headers.host='127.0.0.1:'+port;
+     if (req.headers.origin) req.headers.origin='http://'+req.headers.host;
+     return true;
+diff --git a/sidecar/nexus-network.js b/sidecar/nexus-network.js
+index 3f8d8e19a..a250ce2bc 100644
+--- a/sidecar/nexus-network.js
++++ b/sidecar/nexus-network.js
+@@ -3,6 +3,7 @@ const fs = require('node:fs');
+ const path = require('node:path');
+ const { randomUUID } = require('node:crypto');
+ const { writeFileDurable } = require('./durable-write');
++const { reportedWindow } = require('./providers/openai-compatible')._internals;
+ const { classifyHost } = require('./net/safe-egress');
+ 
+ function privateTarget(url) {
+@@ -19,7 +20,7 @@ function networkStore(root, publish) {
+   const states = new Map();
+   let cursor = 0;
+   function state(id) {
+-    if (!states.has(id)) states.set(id,{active:0,waiting:[],status:'unknown',models:[]});
++    if (!states.has(id)) states.set(id,{active:0,waiting:[],status:'unknown',models:[],windows:{}});
+     return states.get(id);
+   }
+   function list() {
+@@ -43,6 +44,7 @@ function networkStore(root, publish) {
+       const baseUrl = url.href.replace(/\/+$/,'');
+       const r = { id: action === 'edit' ? old.id : 'nexus-'+randomUUID(), rev:randomUUID(), baseUrl,
+         name:String(v.name || '').trim(), model:String(v.model || '').trim(), key:String(input.key ?? (old?.baseUrl === baseUrl ? old.key : '') ?? ''),
++        redactKey: importing ? input.redactKey !== false : (input.key === undefined && old ? old.redactKey !== false : true),
+         enabled:v.enabled !== false, protocol:v.protocol || 'openai', auth:v.auth || 'bearer', mode:v.mode || 'manual',
+         alternatives:[...new Set(v.alternatives || [])] };
+       if (!r.name || !['openai','ollama'].includes(r.protocol) || !['bearer','x-api-key'].includes(r.auth)) throw Error('Invalid name, protocol or authentication');
+@@ -59,7 +61,7 @@ function networkStore(root, publish) {
+     fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
+     writeFileDurable({fs,path},file,JSON.stringify(record));
+     rows = next; saved = record;
+-    if (old && action !== 'duplicate') Object.assign(state(old.id),{status:'unknown',latency:null,models:[],error:'',speed:null});
++    if (old && action !== 'duplicate') Object.assign(state(old.id),{status:'unknown',latency:null,models:[],windows:{},error:'',speed:null});
+     publish(list());
+     return list();
+   }
+@@ -84,13 +86,13 @@ function networkStore(root, publish) {
+     if (!row?.enabled) throw Error('Endpoint unavailable');
+     const s = state(id), start = performance.now();
+     try {
+-      const res = await transport(row,fetch)(row.baseUrl+'/models');
++      const res = await transport(row,fetch)(row.baseUrl+'/models',{signal:AbortSignal.timeout(Math.min(row.timeout,8000))});
+       if (!res.ok) throw Error('HTTP '+res.status);
+       const body = await res.json();
+       if (!Array.isArray(body.data)) throw Error('Invalid catalog');
+-      if (row === rows.get(id)) Object.assign(s,{status:'online',error:'',models:body.data.map(m=>m.id).filter(m=>typeof m === 'string')});
++      if (row === rows.get(id)) Object.assign(s,{status:'online',error:'',models:body.data.map(m=>m?.id).filter(m=>typeof m === 'string'),windows:Object.fromEntries(body.data.filter(m=>m && typeof m.id==='string' && reportedWindow(m)>0).map(m=>[m.id,reportedWindow(m)]))});
+     } catch (e) {
+-      if (row === rows.get(id)) Object.assign(s,{status:'offline',error:/^HTTP \d+$/.test(e.message) ? e.message : 'Discovery failed',models:[]});
++      if (row === rows.get(id)) Object.assign(s,{status:'offline',error:/^HTTP \d+$/.test(e.message) ? e.message : 'Discovery failed',models:[],windows:{}});
+     }
+     if (row === rows.get(id)) s.latency = Math.round(performance.now()-start);
+     return s;
+@@ -117,6 +119,10 @@ function networkStore(root, publish) {
+             if (event.type === 'usage' && Number.isFinite(tokens)) s.speed = tokens*1000/Math.max(1,performance.now()-start);
+             yield event;
+           }
++          if (row === rows.get(row.id)) { s.status='online'; s.error=''; }
++        } catch (error) {
++          if (!req.signal?.aborted && row === rows.get(row.id)) { s.error='Inference request failed'; s.status='unknown'; }
++          throw error;
+         } finally { s.active--; s.waiting.shift()?.(); }
+       }};
+   }
+@@ -151,7 +157,7 @@ function networkStore(root, publish) {
+     }};
+   }
+   publish(list());
+-  return {list,save,adapter,probe,get:id=>rows.get(id),keys:()=>[...rows.values()].map(r=>r.key).filter(Boolean),
+-    migrate(key,baseUrl) { if (!saved.imported && baseUrl) save('add',{name:'Custom endpoint (imported)',key,baseUrl},true); }};
++  return {list,save,adapter,probe,get:id=>rows.get(id),keys:()=>[...rows.values()].filter(r=>r.redactKey !== false).map(r=>r.key).filter(Boolean),
++    migrate(key,baseUrl,redactKey=true) { if (!saved.imported && baseUrl) save('add',{name:'Custom endpoint (imported)',key,baseUrl,redactKey},true); }};
+ }
+ module.exports = {networkStore};
+diff --git a/test/credential-store.no-crossing.test.js b/test/credential-store.no-crossing.test.js
+index b9f7dbf47..4893c754a 100644
+--- a/test/credential-store.no-crossing.test.js
++++ b/test/credential-store.no-crossing.test.js
+@@ -646,6 +646,7 @@ const JWT_CLAIM = /\['https:\/\/api\.openai\.com\/(?:auth|profile)'\]/;
+    row, which names the dialer and where its key and endpoint come from; section 4 drives the module-level ones. A new site with
+    no row fails here, whoever adds it. An adapter under sidecar/providers/ dials what selectProvider built it with. */
+ const DIALERS = {
++  'sidecar/nexus-network.js transport': 'configured endpoint key bound to its saved origin; redirects forbidden',
+   'sidecar/index.js runOnceCore': 'the run adapter, pool rotation and provider fallbacks: one resolution of the key and the endpoint for it',
+   'sidecar/index.js providerForRunConfig': 'the station default\'s billed calls (routing fixes, drafted lines): a run config\'s own pair',
+   'sidecar/index.js probeChannelRunConfig': 'the channel connect probe: channelRunConfigFor\'s pair',
+diff --git a/test/helpers/credential-store-sandbox.js b/test/helpers/credential-store-sandbox.js
+index 6b1bbfdb5..e41da3311 100644
+--- a/test/helpers/credential-store-sandbox.js
++++ b/test/helpers/credential-store-sandbox.js
+@@ -234,10 +234,10 @@ function heldValues(api, o) {
+   const body = ['secretPart', 'stationSecretValues', 'stationCredentialValues'].map(n => lift(text, n)).join('\n') +
+     '\nlet childEnv = null;\nconst setStationSecretSource = s => { childEnv = s; };\n' + stmt +
+     '\nreturn { known: () => stationSecretValues(), childEnv, prompt: () => stationCredentialValues() };';
+-  const FREE = ['credStore', 'collectSecretValues', 'failNote', 'process', 'CREDITS_TOKEN', 'channelTokenRuntime', 'channelSecrets', 'codexTokens',
++  const FREE = ['nexus', 'credStore', 'collectSecretValues', 'failNote', 'process', 'CREDITS_TOKEN', 'channelTokenRuntime', 'channelSecrets', 'codexTokens',
+     'oauthProviders', 'connectorOauth', 'connectorConfigs', 'gmailImapTransport', 'liveServiceKeys', 'serviceKeysOwnedEnv'];
+   const notes = [];
+-  const out = new Function(...FREE, "'use strict';\n" + body)(api.credStore, req(ROOT, 'sidecar/secret-values.js').collectSecretValues,
++  const out = new Function(...FREE, "'use strict';\n" + body)({keys:()=>[]}, api.credStore, req(ROOT, 'sidecar/secret-values.js').collectSecretValues,
+     tag => { notes.push(tag); }, { env: api.host.env }, '', {}, (o && o.channelSecrets) || {}, null, {}, null, [], { passwordOf: () => '' }, () => [], {});
+   return Object.assign(out, { notes });
+ }
+diff --git a/test/nexus-server.test.js b/test/nexus-server.test.js
+new file mode 100644
+index 000000000..4f8621efe
+--- /dev/null
++++ b/test/nexus-server.test.js
+@@ -0,0 +1,102 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const os = require('node:os');
++const path = require('node:path');
++const http = require('node:http');
++const {spawn} = require('node:child_process');
++const {once} = require('node:events');
++const {setTimeout:delay} = require('node:timers/promises');
++const {networkStore} = require('../sidecar/nexus-network');
++function temp(t) {
++  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'nexus-test-'));
++  t.after(()=>fs.rmSync(dir,{recursive:true,force:true})); return dir;
++}
++async function listen(server) { server.listen(0,'127.0.0.1'); await once(server,'listening'); return server.address().port; }
++test('100 endpoints, revisions, migration, private persistence and restart',t=>{
++  const dir=temp(t), open=()=>networkStore(dir,()=>{}), store=open();
++  for(let i=0;i<100;i++) store.save('add',{name:'server '+i,baseUrl:'http://127.0.0.1:9000/v1',key:'fixture-secret'});
++  const rows=store.list(); assert.equal(new Set(rows.map(r=>r.id)).size,100);
++  assert.ok(!JSON.stringify(rows).includes('fixture-secret'));
++  store.save('duplicate',{...rows[0],name:'copy'});
++  store.save('edit',{...rows[0],enabled:false});
++  assert.throws(()=>store.save('delete',rows[0]),/changed/);
++  store.migrate('old','http://localhost:11434/v1');open().migrate('old','http://localhost:11434/v1');
++  assert.equal(open().list().length,102);
++  assert.equal(fs.statSync(path.join(dir,'.secrets/inference-network.json')).mode & 511,384);
++});
++test('authenticated station routes overlapping crew runs to independent servers, survives disconnect and restart',async t=>{
++  const dir=temp(t), markers=['aster','birch'];let active=0,peak=0;
++  const targets=await Promise.all(markers.map(async marker=>{
++    const server=http.createServer(async(req,res)=>{
++      if(req.url==='/v1/models') { res.setHeader('content-type','application/json');return res.end(JSON.stringify({data:[{id:'same-model',context_length:32000}]})); }
++      if(req.url!=='/v1/chat/completions') {res.writeHead(404);return res.end();}
++      req.resume();active++;peak=Math.max(peak,active);await delay(300);active--;
++      res.writeHead(200,{'content-type':'text/event-stream'});
++      for(const item of [{choices:[{delta:{content:marker}}]},{choices:[{delta:{},finish_reason:'stop'}]}]) res.write('data: '+JSON.stringify(item)+'\n\n');
++      res.end('data: [DONE]\n\n');
++    });
++    t.after(()=>server.close());return 'http://127.0.0.1:'+await listen(server)+'/v1';
++  }));
++  const reservation=http.createServer(),port=await listen(reservation);await new Promise(r=>reservation.close(r));
++  const base='http://127.0.0.1:'+port,password=require('node:crypto').randomBytes(24).toString('hex');
++  const headers={authorization:'Basic '+Buffer.from('commander:'+password).toString('base64'),'content-type':'application/json'};
++  let child;
++  async function stop() { if(child && child.exitCode===null && child.signalCode===null) {const done=once(child,'exit');child.kill();await done;} }
++  t.after(stop);
++  async function start() {
++    child=spawn(process.execPath,['scripts/nexus-server.js'],{env:{...process.env,NEXUS_PASSWORD:password,NEXUS_DATA_DIR:dir,NEXUS_PORT:String(port),NEXUS_PUBLIC_URL:base},stdio:'ignore'});
++    for(let i=0;i<200;i++){
++      if(child.exitCode!==null) throw Error('Server exited '+child.exitCode);
++      const r=await fetch(base,{headers}).catch(()=>null);
++      if(r?.ok){headers['x-starnet-token']=(await r.text()).match(/__STARNET_API_TOKEN__="([^"]+)"/)[1];return;}
++      await delay(50);
++    }
++    throw Error('Station startup timed out');
++  }
++  const call=(route,body,extra={})=>fetch(base+route,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined,...extra});
++  await start();
++  assert.equal((await fetch(base)).status,401);
++  assert.equal((await call('/api/nexus/network',null,{headers:{...headers,origin:'https://foreign.invalid'}})).status,403);
++  const ids=[];
++  for(let i=0;i<2;i++){
++    const r=await call('/api/nexus/network',{action:'add',name:markers[i],baseUrl:targets[i],model:'same-model'});
++    assert.equal(r.status,200);const row=(await r.json()).at(-1);assert.deepEqual(row.models,['same-model']);ids.push(row.id);
++  }
++  const roster=await call('/api/roster',{agents:ids.map((provider,i)=>({agentId:'crew-'+i,name:markers[i],model:'same-model',provider}))});
++  assert.equal(roster.status,200);
++  const run=(id,fields={},extra)=>call('/api/run',{agentId:id,model:'same-model',messages:[{role:'user',content:'say hello'}],...fields},extra);
++  await Promise.all(ids.map(async(_,i)=>{const r=await run('crew-'+i);assert.equal(r.status,200);assert.match(await r.text(),new RegExp(markers[i]));}));
++  assert.ok(peak>=2,'requests overlapped across machines');
++  const ac=new AbortController(), detached=await run('unattended',{provider:ids[0]},{signal:ac.signal});assert.equal(detached.status,200);ac.abort();
++  let complete=false;
++  for(let i=0;i<80&&!complete;i++){await delay(100);const history=await (await call('/api/runs?agent=unattended')).json();complete=history.runs?.some(r=>r.reason==='done');}
++  assert.ok(complete,'disconnected task finished');
++  await stop();await start();assert.deepEqual((await (await call('/api/nexus/network')).json()).map(r=>r.id),ids);
++});
++test('authorized failover preserves streamed tool arguments, credential origin and context ceiling',async t=>{
++  const root=temp(t), registry=require('../sidecar/providers/registry'),factory=require('../sidecar/providers/factory');
++  const store=networkStore(root,registry.setNetwork);factory.attachNetwork(store);
++  let available=false,requests=0;
++  const server=http.createServer(async(req,res)=>{
++    if(req.url==='/v1/models') {res.setHeader('content-type','application/json');return res.end(JSON.stringify({data:[{id:'same',context_length:8192}]}));}
++    requests++;assert.equal(req.headers.authorization,'Bearer secondary-secret');
++    res.writeHead(200,{'content-type':'text/event-stream'});
++    const fn={id:'one',index:0,type:'function',function:{name:'measure',arguments:'{}'}};
++    res.end('data: '+JSON.stringify({choices:[{delta:{tool_calls:[fn]},finish_reason:'tool_calls'}]})+'\n\ndata: [DONE]\n\n');
++  });
++  t.after(()=>server.close());const url='http://127.0.0.1:'+await listen(server);
++  const dead=http.createServer((req,res)=>{res.writeHead(available?200:503,{'content-type':'application/json'});res.end(JSON.stringify({data:[{id:'same'}]}));});
++  t.after(()=>dead.close());const primaryURL='http://127.0.0.1:'+await listen(dead);
++  const common={model:'same',context:4000,tools:true};
++  const secondary=store.save('add',{...common,name:'secondary',baseUrl:url+'/v1',key:'secondary-secret'})[0];
++  const primary=store.save('add',{...common,name:'primary',baseUrl:primaryURL+'/v1',key:'primary-secret',mode:'failover',alternatives:[secondary.id]}).at(-1);
++  const adapter=factory.selectProvider({provider:primary.id});
++  assert.equal(adapter.contextLimit('same'),4000);
++  const events=[];
++  for await(const e of adapter.stream({model:'same',messages:[{role:'user',content:'measure'}],tools:[]}))events.push(e);
++  assert.ok(events.some(e=>e.type==='tool_start'&&e.name==='measure'));assert.ok(events.some(e=>e.type==='tool_args'&&e.chunk==='{}'));
++  assert.equal(requests,1);assert.equal(store.list()[0].windows.same,8192);
++  assert.equal(store.list().at(-1).status,'offline');available=true;assert.equal((await store.probe(primary.id)).status,'online');
++});
+diff --git a/test/update-drain-wiring.test.js b/test/update-drain-wiring.test.js
+index 21d6485d4..1039c0bea 100644
+--- a/test/update-drain-wiring.test.js
++++ b/test/update-drain-wiring.test.js
+@@ -105,7 +105,7 @@ function host() {
+ 
+ /* ---- 3. the wiring: the barrier is built on those helpers, and every runOnceCore call is counted ---- */
+ {
+-  const wire = src.slice(src.indexOf('updatePreparation = makeUpdatePreparation({'), src.indexOf('const server = http.createServer('));
++  const wire = src.slice(src.indexOf('updatePreparation = makeUpdatePreparation({'), src.indexOf('const listener = (req, res) =>'));
+   A.ok(wire.length > 200 && wire.length < 4000, 'updatePreparation wiring located (length guard)');
+   A.ok(/liveRuns: \(\) => updateLiveRunCount\(\)/.test(wire), 'liveRuns counts every registry, not runs.size');
+   A.ok(/abortRuns: \(\) => updateAbortLiveRuns\(\)/.test(wire), 'abortRuns stops every lane, not runs alone');
+diff --git a/website/app/app/nexus-network.js b/website/app/app/nexus-network.js
+index fbce3717b..21a1385bd 100644
+--- a/website/app/app/nexus-network.js
++++ b/website/app/app/nexus-network.js
+@@ -29,7 +29,10 @@ class InferenceNetwork extends HTMLElement {
+         if (Number.isFinite(r.latency)) info.push(r.latency+' ms');
+         if (Number.isFinite(r.speed)) info.push(r.speed.toFixed(1)+' output tokens/s (whole request)');
+         this.node('p',info.filter(Boolean).join(' · '),box);
+-        this.node('p',r.models.join(', ') || r.model || 'No catalog yet',box);
++        this.node('p',r.models.map(id=>id+(r.windows?.[id]?' ('+r.windows[id]+' context)':'')).join(', ') || r.model || 'No catalog yet',box);
++        const limits = [r.context && 'Context '+r.context,r.output && 'Output '+r.output];
++        for (const [field,label] of [['tools','Tools'],['vision','Vision']]) if (typeof r[field]==='boolean') limits.push(label+' '+(r[field]?'enabled':'disabled'));
++        if (limits.some(Boolean)) this.node('p',limits.filter(Boolean).join(' · '),box);
+         const action=(name,extra={})=>this.refresh({action:name,id:r.id,rev:r.rev,...extra});
+         const setup=this.closest('#genesis-network');
+         if (setup && r.enabled) this.button(box,'Use this endpoint',()=>setup.chooseEndpoint(r));
+@@ -61,6 +64,10 @@ class InferenceNetwork extends HTMLElement {
+         input.value=row[name] ?? options ?? '';
+       }
+     }
++    if (row.hasKey) {
++      const clear=this.node('input','',this.node('label','Remove stored API key ',form));
++      clear.name='clearKey'; clear.type='checkbox';
++    }
+     this.node('p','Authorized alternatives',form);
+     for(const r of this.rows.filter(r=>r.id!==row.id)) {
+       const input=this.node('input','',this.node('label',r.name+' ',form));
+@@ -72,7 +79,7 @@ class InferenceNetwork extends HTMLElement {
+     form.onsubmit=event=>{
+       event.preventDefault();
+       const data=new FormData(form), values=Object.fromEntries(data);
+-      if(!values.key) delete values.key;
++      if(values.clearKey) values.key=''; else if(!values.key) delete values.key;
+       for(const field of ['tools','vision']) values[field]=values[field]==='unknown'?null:values[field]==='yes';
+       this.refresh({...values,alternatives:data.getAll('alternate'),action:row.id?'edit':'add',id:row.id,rev:row.rev});
+     };
