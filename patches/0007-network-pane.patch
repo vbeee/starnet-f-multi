@@ -1,0 +1,218 @@
+From 515170e766cf5f86f28b16990982c209ead68974 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:50:34 -0800
+Subject: [PATCH] Add a dedicated live inference network settings pane
+
+---
+ frontend/app/nexus-network.js    | 25 +++++++++++++++++++++----
+ frontend/app/stationui.js        |  4 ++--
+ frontend/css/settings.css        |  9 +++++++++
+ website/app/app/nexus-network.js | 25 +++++++++++++++++++++----
+ website/app/app/stationui.js     |  4 ++--
+ website/app/css/settings.css     |  9 +++++++++
+ 6 files changed, 64 insertions(+), 12 deletions(-)
+
+diff --git a/frontend/app/nexus-network.js b/frontend/app/nexus-network.js
+index 21a1385bd..52dd6c9c7 100644
+--- a/frontend/app/nexus-network.js
++++ b/frontend/app/nexus-network.js
+@@ -1,6 +1,13 @@
+ 'use strict';
+ class InferenceNetwork extends HTMLElement {
+-  connectedCallback() { this.refresh(); }
++  connectedCallback() {
++    this.refresh();
++    this.timer = setInterval(() => {
++      if (!document.hidden && this.getClientRects().length && !this.querySelector('form') &&
++          !this.contains(document.activeElement) && !this.loading) this.refresh(undefined,true);
++    },5000);
++  }
++  disconnectedCallback() { clearInterval(this.timer); this.sequence=(this.sequence || 0)+1; }
+   node(tag,text,parent=this) {
+     const el=document.createElement(tag);
+     el.textContent=text;
+@@ -11,15 +18,19 @@ class InferenceNetwork extends HTMLElement {
+     const button=this.node('button',label,parent);
+     button.type='button'; button.className='bb sm'; button.onclick=action;
+   }
+-  async refresh(payload) {
++  async refresh(payload,quiet=false) {
++    const sequence=this.sequence=(this.sequence || 0)+1;
++    this.loading=true;
+     try {
+       const res=await fetch('/api/nexus/network',payload ? {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)} : {cache:'no-store'});
+       const rows=await res.json();
++      if (sequence!==this.sequence || !this.isConnected) return;
+       if (!res.ok) throw Error(rows.error || 'Network unavailable');
++      if (quiet && JSON.stringify(rows)===JSON.stringify(this.rows)) return;
+       this.rows=rows;
+       SK.providers.registry.setNetwork(rows);
+       this.replaceChildren();
+-      this.node('h4','Inference Network').className='ms-h';
++      if (this.closest('#genesis-network')) this.node('h4','Inference Network').className='ms-h';
+       this.button(this,'Add endpoint',()=>this.edit({}));
+       this.button(this,'Refresh',()=>this.refresh());
+       for (const r of rows) {
+@@ -42,9 +53,15 @@ class InferenceNetwork extends HTMLElement {
+         this.button(box,r.enabled?'Disable':'Enable',()=>action('edit',{enabled:!r.enabled}));
+         this.button(box,'Delete',()=>{if(confirm('Delete '+r.name+'?')) action('delete');});
+       }
+-    } catch(e) {this.node('p',e.message);}
++    } catch(e) {
++      if (sequence===this.sequence && this.isConnected) {
++        (this.querySelector('[role=status]') || this.node('p','')).setAttribute('role','status');
++        this.querySelector('[role=status]').textContent=e.message;
++      }
++    } finally { if (sequence===this.sequence) this.loading=false; }
+   }
+   edit(row) {
++    this.sequence++; this.loading=false;
+     this.replaceChildren();
+     const form=this.node('form','');
+     const fields=[['name','Display name'],['baseUrl','API base URL including /v1'],['key','API key (blank keeps current key on same URL)'],
+diff --git a/frontend/app/stationui.js b/frontend/app/stationui.js
+index 0ef58a0d8..bfc2fef6d 100644
+--- a/frontend/app/stationui.js
++++ b/frontend/app/stationui.js
+@@ -8155,13 +8155,12 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
+     // settings test source-locks them). mountConsole builds these panes once and returns a content host
+     // that spans them all, so the wireX calls below reach every control with no per-section rewire.
+     const secProviders = () =>
+-      '<inference-network></inference-network>' +
+       // NB: no inner "PROVIDERS" heading — the console section head already prints PROVIDERS above the pane
+       // (a second identical h4 read as a duplicated title in sys-settings.png).
+       '<div class="prov-list">' + providersHtml() + '</div>' +
+       '<h4 class="ms-h">API KEYS</h4>' +
+       '<div class="key-list">' + keysHtml() + '</div>' +
+-      '<p class="set-about">Your keys stay on this computer, always masked; the desktop app keeps them in the system keychain when it can.</p>' +
++      (globalThis.__NEXUS_SERVER__ ? '<p class="set-about">Provider keys are stored on the station server.</p>' : '<p class="set-about">Your keys stay on this computer, always masked; the desktop app keeps them in the system keychain when it can.</p>') +
+       // org P05: model keys live here; a SERVICE key lives in CONNECT › ABILITIES › CONNECTED › API KEYS — one door, the
+       // places.js api-connections target (live walk 10-14: the door used to open the catalog, so no key reached the place the
+       // sentence named). Gmail and Notion are SIGN IN catalog connectors (sidecar/mcp/catalog.js authType 'oauth') that an
+@@ -8702,6 +8701,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
+ 
+     const sections = [
+       { id: 'providers', label: 'AI & MODELS', glyph: '⌁', desc: 'The AI your agents think with. Connect one below: StarNet credits, a subscription you have, an API key, or your own models. Everything under API KEYS is optional.', build: el => frag(secProviders() + secModels)(el) },
++      { id: 'inference-network', label: 'INFERENCE NETWORK', glyph: '⌁', desc: 'Inference servers and the models they offer.', build: el => frag('<inference-network></inference-network>')(el) },
+       // ONE WORD: AUTONOMY — the dial and what it did while you were away are one section (the old NIGHT SHIFT
+       // section folded in; openTerm maps its id here so an old deep link still lands).
+       { id: 'autonomy', label: 'AUTONOMY', glyph: '◈', desc: 'Choose when agents work on their own, where that work goes, and see what they did while you were away.', build: frag(secAutonomy + secAwayActivity) },
+diff --git a/frontend/css/settings.css b/frontend/css/settings.css
+index ad9b35d19..183f8ac8d 100644
+--- a/frontend/css/settings.css
++++ b/frontend/css/settings.css
+@@ -202,3 +202,12 @@
+ .settings-console #rmt-msg.bad { color:var(--bad); }
+ /* org P03: an error door that lands on a provider card marks it for a moment (StationUI.focusProvider) */
+ .settings-console .prov-card.prov-landed { border-color: rgba(var(--ph-bright-rgb), .85); box-shadow: inset 0 0 0 1px rgba(var(--ph-bright-rgb), .45); }
++
++/* Endpoint console shares the station palette and remains usable on a narrow screen. */
++inference-network { display: block; min-width: 0; overflow-wrap: anywhere; }
++inference-network section { padding: .8rem; margin-top: .7rem; border: 1px solid rgba(var(--ph-rgb), .25); background: var(--menu-glass); }
++inference-network strong { color: var(--ph-bright); }
++inference-network p { margin: .45rem 0; }
++inference-network .bb { white-space: normal; margin: .15rem .25rem .15rem 0; }
++inference-network form label { display: block; }
++inference-network form :is(input:not([type=checkbox]), select) { box-sizing: border-box; display: block; width: min(100%, 32rem); max-width: 100%; }
+diff --git a/website/app/app/nexus-network.js b/website/app/app/nexus-network.js
+index 21a1385bd..52dd6c9c7 100644
+--- a/website/app/app/nexus-network.js
++++ b/website/app/app/nexus-network.js
+@@ -1,6 +1,13 @@
+ 'use strict';
+ class InferenceNetwork extends HTMLElement {
+-  connectedCallback() { this.refresh(); }
++  connectedCallback() {
++    this.refresh();
++    this.timer = setInterval(() => {
++      if (!document.hidden && this.getClientRects().length && !this.querySelector('form') &&
++          !this.contains(document.activeElement) && !this.loading) this.refresh(undefined,true);
++    },5000);
++  }
++  disconnectedCallback() { clearInterval(this.timer); this.sequence=(this.sequence || 0)+1; }
+   node(tag,text,parent=this) {
+     const el=document.createElement(tag);
+     el.textContent=text;
+@@ -11,15 +18,19 @@ class InferenceNetwork extends HTMLElement {
+     const button=this.node('button',label,parent);
+     button.type='button'; button.className='bb sm'; button.onclick=action;
+   }
+-  async refresh(payload) {
++  async refresh(payload,quiet=false) {
++    const sequence=this.sequence=(this.sequence || 0)+1;
++    this.loading=true;
+     try {
+       const res=await fetch('/api/nexus/network',payload ? {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)} : {cache:'no-store'});
+       const rows=await res.json();
++      if (sequence!==this.sequence || !this.isConnected) return;
+       if (!res.ok) throw Error(rows.error || 'Network unavailable');
++      if (quiet && JSON.stringify(rows)===JSON.stringify(this.rows)) return;
+       this.rows=rows;
+       SK.providers.registry.setNetwork(rows);
+       this.replaceChildren();
+-      this.node('h4','Inference Network').className='ms-h';
++      if (this.closest('#genesis-network')) this.node('h4','Inference Network').className='ms-h';
+       this.button(this,'Add endpoint',()=>this.edit({}));
+       this.button(this,'Refresh',()=>this.refresh());
+       for (const r of rows) {
+@@ -42,9 +53,15 @@ class InferenceNetwork extends HTMLElement {
+         this.button(box,r.enabled?'Disable':'Enable',()=>action('edit',{enabled:!r.enabled}));
+         this.button(box,'Delete',()=>{if(confirm('Delete '+r.name+'?')) action('delete');});
+       }
+-    } catch(e) {this.node('p',e.message);}
++    } catch(e) {
++      if (sequence===this.sequence && this.isConnected) {
++        (this.querySelector('[role=status]') || this.node('p','')).setAttribute('role','status');
++        this.querySelector('[role=status]').textContent=e.message;
++      }
++    } finally { if (sequence===this.sequence) this.loading=false; }
+   }
+   edit(row) {
++    this.sequence++; this.loading=false;
+     this.replaceChildren();
+     const form=this.node('form','');
+     const fields=[['name','Display name'],['baseUrl','API base URL including /v1'],['key','API key (blank keeps current key on same URL)'],
+diff --git a/website/app/app/stationui.js b/website/app/app/stationui.js
+index 0ef58a0d8..bfc2fef6d 100644
+--- a/website/app/app/stationui.js
++++ b/website/app/app/stationui.js
+@@ -8155,13 +8155,12 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
+     // settings test source-locks them). mountConsole builds these panes once and returns a content host
+     // that spans them all, so the wireX calls below reach every control with no per-section rewire.
+     const secProviders = () =>
+-      '<inference-network></inference-network>' +
+       // NB: no inner "PROVIDERS" heading — the console section head already prints PROVIDERS above the pane
+       // (a second identical h4 read as a duplicated title in sys-settings.png).
+       '<div class="prov-list">' + providersHtml() + '</div>' +
+       '<h4 class="ms-h">API KEYS</h4>' +
+       '<div class="key-list">' + keysHtml() + '</div>' +
+-      '<p class="set-about">Your keys stay on this computer, always masked; the desktop app keeps them in the system keychain when it can.</p>' +
++      (globalThis.__NEXUS_SERVER__ ? '<p class="set-about">Provider keys are stored on the station server.</p>' : '<p class="set-about">Your keys stay on this computer, always masked; the desktop app keeps them in the system keychain when it can.</p>') +
+       // org P05: model keys live here; a SERVICE key lives in CONNECT › ABILITIES › CONNECTED › API KEYS — one door, the
+       // places.js api-connections target (live walk 10-14: the door used to open the catalog, so no key reached the place the
+       // sentence named). Gmail and Notion are SIGN IN catalog connectors (sidecar/mcp/catalog.js authType 'oauth') that an
+@@ -8702,6 +8701,7 @@ const StationUI = typeof document === 'undefined' ? {} : (() => {
+ 
+     const sections = [
+       { id: 'providers', label: 'AI & MODELS', glyph: '⌁', desc: 'The AI your agents think with. Connect one below: StarNet credits, a subscription you have, an API key, or your own models. Everything under API KEYS is optional.', build: el => frag(secProviders() + secModels)(el) },
++      { id: 'inference-network', label: 'INFERENCE NETWORK', glyph: '⌁', desc: 'Inference servers and the models they offer.', build: el => frag('<inference-network></inference-network>')(el) },
+       // ONE WORD: AUTONOMY — the dial and what it did while you were away are one section (the old NIGHT SHIFT
+       // section folded in; openTerm maps its id here so an old deep link still lands).
+       { id: 'autonomy', label: 'AUTONOMY', glyph: '◈', desc: 'Choose when agents work on their own, where that work goes, and see what they did while you were away.', build: frag(secAutonomy + secAwayActivity) },
+diff --git a/website/app/css/settings.css b/website/app/css/settings.css
+index ad9b35d19..183f8ac8d 100644
+--- a/website/app/css/settings.css
++++ b/website/app/css/settings.css
+@@ -202,3 +202,12 @@
+ .settings-console #rmt-msg.bad { color:var(--bad); }
+ /* org P03: an error door that lands on a provider card marks it for a moment (StationUI.focusProvider) */
+ .settings-console .prov-card.prov-landed { border-color: rgba(var(--ph-bright-rgb), .85); box-shadow: inset 0 0 0 1px rgba(var(--ph-bright-rgb), .45); }
++
++/* Endpoint console shares the station palette and remains usable on a narrow screen. */
++inference-network { display: block; min-width: 0; overflow-wrap: anywhere; }
++inference-network section { padding: .8rem; margin-top: .7rem; border: 1px solid rgba(var(--ph-rgb), .25); background: var(--menu-glass); }
++inference-network strong { color: var(--ph-bright); }
++inference-network p { margin: .45rem 0; }
++inference-network .bb { white-space: normal; margin: .15rem .25rem .15rem 0; }
++inference-network form label { display: block; }
++inference-network form :is(input:not([type=checkbox]), select) { box-sizing: border-box; display: block; width: min(100%, 32rem); max-width: 100%; }
