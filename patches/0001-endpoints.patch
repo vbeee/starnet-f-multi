@@ -1,0 +1,429 @@
+From d17a570e3f61cd804815555573032ac996068056 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 25 Nov 2026 06:29:59 -0800
+Subject: [PATCH] Persist independent endpoint identities, credentials and
+ authorized inference routes
+
+---
+ frontend/app/provider-registry.js |  16 ++-
+ sidecar/index.js                  |  29 +++++-
+ sidecar/nexus-network.js          | 157 ++++++++++++++++++++++++++++++
+ sidecar/providers/factory.js      |   8 +-
+ sidecar/providers/registry.js     |  16 ++-
+ 5 files changed, 219 insertions(+), 7 deletions(-)
+ create mode 100644 sidecar/nexus-network.js
+
+diff --git a/frontend/app/provider-registry.js b/frontend/app/provider-registry.js
+index ebb0b877c..bdc6f539f 100644
+--- a/frontend/app/provider-registry.js
++++ b/frontend/app/provider-registry.js
+@@ -6,7 +6,7 @@
+ (function (root, factory) {
+   const api = factory();
+   if (typeof module !== 'undefined' && module.exports) module.exports = api;
+-  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.registry = api; }
++  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.registry = api; if (root.__NEXUS_NETWORK__) api.setNetwork(root.__NEXUS_NETWORK__); }
+ })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+   'use strict';
+ 
+@@ -636,18 +636,29 @@
+     for (const a of (profile.aliases || [])) ALIASES.set(String(a).toLowerCase(), profile.id);
+   }
+ 
++  let network = new Map();
++  function setNetwork(rows) {
++    network = new Map(rows.filter(r => /^nexus-[a-f0-9-]{36}$/.test(r.id)).map(r => [r.id, {
++      ...BY_ID.get('custom'), id:r.id, name:r.name, label:r.name, aliases:[], live:r.enabled,
++      baseUrl:r.baseUrl, endpoint:r.baseUrl, keyEnv:[], baseUrlEnv:[], credentialPool:false,
++      requiresBaseUrl:false, nativeOllama:r.protocol === 'ollama', supportsTools:r.tools,
++      maxOutputTokens:r.output, connectTimeoutMs:r.timeout, manualModel:r.model
++    }]));
++  }
+   function canonicalKey(value) {
+     return String(value || '').trim().toLowerCase();
+   }
+   function getProviderProfile(value) {
+     const key = canonicalKey(value);
+     if (!key) return null;
++    if (network.has(key)) return network.get(key);
+     const id = ALIASES.get(key);
+     return id ? BY_ID.get(id) || null : null;
+   }
+   function normalizeProviderId(value, fallback) {
+     const profile = getProviderProfile(value);
+     if (profile) return profile.id;
++    if (/^nexus-[a-f0-9-]{36}$/.test(value)) return value;
+     return fallback == null ? '' : String(fallback);
+   }
+   function providerUsesCodex(value) {
+@@ -698,7 +709,7 @@
+   }
+   function listProviderProfiles(opts) {
+     opts = opts || {};
+-    return PROFILES
++    return PROFILES.concat([...network.values()])
+       .filter(p => opts.includeInactive || p.live !== false)
+       .slice()
+       .sort((a, b) => (a.order || 1000) - (b.order || 1000) || a.id.localeCompare(b.id))
+@@ -719,6 +730,7 @@
+     providerRequiresKey,
+     providerRequiresBaseUrl,
+     providerIds,
++    setNetwork,
+     _profiles: PROFILES
+   };
+ });
+diff --git a/sidecar/index.js b/sidecar/index.js
+index 0f21215bc..03c9bdd13 100644
+--- a/sidecar/index.js
++++ b/sidecar/index.js
+@@ -1196,6 +1196,8 @@ const engineKeys = engineCredential.makeEngineKeys({
+ const DESKTOP_ENDPOINTS_FILE = path.join(WORKSPACES, '.secrets', 'provider-endpoints.json');
+ const CHANNEL_CREDENTIALS_FILE = path.join(WORKSPACES, '.secrets', 'channel-credentials.json');
+ const SHELL_PUSHES_PROVIDER_CONFIG = !!String(ENV('IPC_TOKEN') || '').trim();
++const nexus = require('./nexus-network').networkStore(WORKSPACES, require('./providers/registry').setNetwork);
++require('./providers/factory').attachNetwork(nexus);
+ const PROVIDER_IDS = Object.freeze(listProviderProfiles({ includeInactive: true, public: false }).map(p => p.id));   // the registry's, fixed
+ const credStore = credentialStore.makeCredentialStore({
+   profile: getProviderProfile,
+@@ -3344,6 +3346,7 @@ function providerRuntimeKeyPool(provider, explicitPool, runKey) { return credSto
+ function providerRuntimeBaseUrl(provider, explicitBaseUrl, runKey, callerKey, inRequest) { return credStore.baseUrl(provider, explicitBaseUrl, runKey, callerKey, inRequest); }
+ function providerHasCredential(provider, key, baseUrl, explicitPool) {
+   const id = normalizeProvider(provider);
++  if (id.startsWith('nexus-')) return !!getProviderProfile(id)?.live;
+   // A subscription sign-in counts only while it is LIVE: its tokens present AND not recorded dead (accountLive, the verdict
+   // accountChain runs on). GitHub #92: a refresh token another client consumed left the tokens on disk, so diagnostics,
+   // /api/runtime/agent and every channel/routine 'configured' said yes to a sign-in no run could use.
+@@ -7178,6 +7181,7 @@ function secretPart(tag, fn) { try { return fn(); } catch (e) { failNote('secret
+ // forHelpers: the list child-env.js strips by value (setStationSecretSource below): no env-layer value, no endpoint part
+ function stationSecretValues(connectorSweep, forHelpers) { return collectSecretValues([
+   { values: [CREDITS_TOKEN, String(process.env.STARNET_CHANNEL_WEBHOOK_SECRET || '')] },
++  { values: secretPart('nexus', () => nexus.keys()) },
+   { values: secretPart('providerCredentials', () => credStore.secretValues({ childEnv: forHelpers === true })) },   // every layer's keys, pools, URL parts, and each channel's own
+   { values: secretPart('channelTokens', () => Object.values(channelTokenRuntime)) },
+   { keyed: channelSecrets },
+@@ -13455,6 +13459,18 @@ const ROUTES = [
+   { m: 'GET', exact: '/api/auth/claude-cli/accounts', h: (req, res) => handleClaudeCliAuth(req, res, 'accounts') },
+   { m: 'POST', exact: '/api/auth/claude-cli/add', h: (req, res) => handleClaudeCliAuth(req, res, 'add') },
+   { m: 'POST', exact: '/api/auth/claude-cli/remove', h: (req, res) => handleClaudeCliAuth(req, res, 'remove') },
++  { m: 'GET', exact: '/api/nexus/network', h:(req,res)=>respondJson(res,200,nexus.list()) },
++  { m: 'POST', exact: '/api/nexus/network', h:async (req,res)=>{
++    try {
++      const {action,...input} = JSON.parse(await readBody(req,65536,res));
++      if (action === 'test') await nexus.probe(input.id);
++      else {
++        const result = nexus.save(action,input);
++        if (action === 'add' && result.at(-1).enabled) await nexus.probe(result.at(-1).id);
++      }
++      return respondJson(res,200,nexus.list());
++    } catch (e) { if (!res.headersSent) return respondJson(res,400,{error:e.message}); }
++  } },
+   { m: 'GET', exact: '/api/providers', h: handleProviders },
+   { m: 'GET', qsplit: '/api/model-tiers', h: handleModelTiers },   // the cloud's editorial tier list (picker badges); {ok:false, reason} when unreachable
+   { m: 'POST', exact: '/api/providers/probe', h: handleProviderProbe },
+@@ -13806,6 +13822,12 @@ server.on('error', (e) => {
+   else console.error('✗ sidecar listen error:', e);
+   process.exit(1);
+ });
++function importNexusCustom() {
++  if (DESKTOP_SHELL) return;
++  try { nexus.migrate(providerRuntimeKey('custom',''),providerRuntimeBaseUrl('custom','')); }
++  catch (_) { console.warn('[nexus] Custom import unavailable. Existing configuration retained.'); }
++}
++importNexusCustom();
+ server.listen(PORT, '127.0.0.1', async () => {
+   verdictReview.resumeHeld(launchVerdictReview);
+   const url = 'http://127.0.0.1:' + PORT;
+@@ -16612,6 +16634,7 @@ async function handleEngineKeySet(req, res) {
+   const id = normalizeProviderIdFromRegistry(body.provider, '');
+   if (!id || !getProviderProfile(id) || id === 'starnet' || providerUsesCodex(id) || providerUsesDeviceOAuth(id)) return json(400, { ok: false, error: 'this provider does not take a key from the page' });
+   const r = credStore.putPage(id, { key: body.key, keyPool: body.keyPool, baseUrl: body.baseUrl }, { boot: body.boot === true, ifRev: typeof body.ifRev === 'string' ? body.ifRev : '' });
++  if (r.ok && id === 'custom') importNexusCustom();
+   if (r.invalid) return json(400, { ok: false, provider: id, error: r.error });
+   if (!r.ok) {
+     const label = providerLabelOf(id);
+@@ -24337,7 +24360,7 @@ async function runOnceCore(o) {
+     rotationFallbacks = oauthAccounts.slice(1).map(a => ({ provider: oauthAccountProvider(providerId, a, baseUrl, reasoningEffort), providerId, model, credKey: a.credKey, account: a.label }));
+   } else if (oauthAccounts) activePrimaryKey = oauthAccounts[0].credKey;
+   const providerFallbacks = [];
+-  const rawProviderFallbacks = savedProviderFallbacks.concat(Array.isArray(o.fallbackProviders) ? o.fallbackProviders : []);
++  const rawProviderFallbacks = providerId.startsWith('nexus-') ? [] : savedProviderFallbacks.concat(Array.isArray(o.fallbackProviders) ? o.fallbackProviders : []);
+   let fbUnsaid = 0;   // skipped past the four-notice cap: counted on one line, never echoed one by one
+   for (const fb of rawProviderFallbacks) {
+     if (!fb || typeof fb !== 'object') continue;
+@@ -28893,6 +28916,7 @@ function handleProviders(req, res) {
+   // configured and where the key comes from are the store's (engine-key presence): credentialSource names the layer the
+   // station's own key comes from, and envName the variable when that is the environment (additive, S2)
+   const providers = listProviderProfiles().map(p => {
++    if (nexus.get(p.id)) return {...p, configured:true, unattendedReady:true, credential:{present:!!nexus.get(p.id).key,status:'unknown'},endpoint:{configured:true,status:'unknown'}};
+     const now = engineKeyPresence(p.id);
+     return Object.assign({}, p, providerReadiness(p.id), { credentialSource: now.credentialSource, envName: now.envName,
+       currentBaseUrl: credStore.maskedUrl(providerRuntimeBaseUrl(p.id, '')) });   // its credential parts masked where they stand (S5)
+@@ -28902,7 +28926,7 @@ function handleProviders(req, res) {
+   // at spawn, updated live through /api/key) rather than the browser's local store. The Settings key-save
+   // confirmation reads this so it names the ACTUAL store honestly (keychain vs this browser) — never claims
+   // keychain when the key is in fact held in the browser (truthful-telemetry law).
+-  res.end(JSON.stringify({ providers, keychainMode: DESKTOP_SHELL }));
++  res.end(JSON.stringify({ providers, network:nexus.list(), keychainMode: DESKTOP_SHELL }));
+ }
+ 
+ // One public verdict. Evidence is bound to the exact active pair; OAuth accounts have separate private
+@@ -31960,6 +31984,7 @@ async function serveStatic(req, res) {
+       if (isAppPage) scriptNonce = crypto.randomBytes(16).toString('base64');
+       let boot = (scriptNonce ? '<script nonce="' + scriptNonce + '">' : '<script>') + (peer.ok ? 'window.__STARNET_API_TOKEN__=' + JSON.stringify(API_TOKEN) + ';'
+         : 'window.__STARNET_TOKEN_WITHHELD__=' + JSON.stringify(peer.reason) + ';');
++      if (peer.ok) boot += 'window.__NEXUS_NETWORK__=' + JSON.stringify(nexus.list()).replace(/</g,'\\u003c') + ';';
+       if (!peer.ok) noteTokenWithheld(peer);
+       // DEV fast-path: hand the page a model + provider hint so a fresh origin auto-resumes the seeded
+       // save with no setup. No secret crosses here — the key stays server-side in the credential store.
+diff --git a/sidecar/nexus-network.js b/sidecar/nexus-network.js
+new file mode 100644
+index 000000000..3f8d8e19a
+--- /dev/null
++++ b/sidecar/nexus-network.js
+@@ -0,0 +1,157 @@
++'use strict';
++const fs = require('node:fs');
++const path = require('node:path');
++const { randomUUID } = require('node:crypto');
++const { writeFileDurable } = require('./durable-write');
++const { classifyHost } = require('./net/safe-egress');
++
++function privateTarget(url) {
++  const host = classifyHost(new URL(url).hostname);
++  return host.ip && !host.embedded && ['private','loopback','unique-local','cgnat'].includes(host.kind);
++}
++
++function networkStore(root, publish) {
++  const file = path.join(root,'.secrets','inference-network.json');
++  let saved = { rows: [], imported: false };
++  try { saved = JSON.parse(fs.readFileSync(file,'utf8')); }
++  catch (e) { if (e.code !== 'ENOENT') throw e; }
++  let rows = new Map(saved.rows.map(r => [r.id,r]));
++  const states = new Map();
++  let cursor = 0;
++  function state(id) {
++    if (!states.has(id)) states.set(id,{active:0,waiting:[],status:'unknown',models:[]});
++    return states.get(id);
++  }
++  function list() {
++    return Array.from(rows.values(), ({key,...entry}) => {
++      const {waiting,...health} = state(entry.id);
++      return {...entry, ...health, hasKey:!!key, queued:waiting.length, status:health.active >= entry.concurrency ? 'busy' : health.status};
++    });
++  }
++  function save(action, input, importing = false) {
++    const old = action === 'add' ? undefined : rows.get(input.id);
++    if (action !== 'add' && (!old || old.rev !== input.rev)) throw Error('Endpoint changed. Refresh and retry.');
++    const next = new Map(rows);
++    if (action === 'delete') {
++      next.delete(old.id);
++      for (const r of next.values()) if (r.alternatives.includes(old.id)) next.set(r.id,{...r,rev:randomUUID(),alternatives:r.alternatives.filter(id => id !== old.id)});
++    } else {
++      if (!['add','edit','duplicate'].includes(action)) throw Error('Unknown endpoint operation');
++      const v = {...old,...input};
++      const url = new URL(v.baseUrl);
++      if (!['http:','https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Use an HTTP(S) base URL without embedded credentials, query or fragment');
++      const baseUrl = url.href.replace(/\/+$/,'');
++      const r = { id: action === 'edit' ? old.id : 'nexus-'+randomUUID(), rev:randomUUID(), baseUrl,
++        name:String(v.name || '').trim(), model:String(v.model || '').trim(), key:String(input.key ?? (old?.baseUrl === baseUrl ? old.key : '') ?? ''),
++        enabled:v.enabled !== false, protocol:v.protocol || 'openai', auth:v.auth || 'bearer', mode:v.mode || 'manual',
++        alternatives:[...new Set(v.alternatives || [])] };
++      if (!r.name || !['openai','ollama'].includes(r.protocol) || !['bearer','x-api-key'].includes(r.auth)) throw Error('Invalid name, protocol or authentication');
++      if (!['manual','priority','balance','failover','local'].includes(r.mode) || (r.mode === 'local' && !privateTarget(baseUrl))) throw Error('Local-only routing requires a private IP address');
++      if (r.alternatives.some(id => !rows.has(id) || id === r.id)) throw Error('Unknown alternative');
++      for (const [field,initial,min] of [['context',0,0],['output',0,0],['timeout',120000,1],['concurrency',1,1],['priority',0,0]]) {
++        r[field] = Number(v[field] ?? initial);
++        if (!Number.isSafeInteger(r[field]) || r[field] < min || r[field] > 2147483647) throw Error('Invalid '+field);
++      }
++      for (const field of ['tools','vision']) r[field] = typeof v[field] === 'boolean' ? v[field] : null;
++      next.set(r.id,r);
++    }
++    const record = { rows:[...next.values()], imported:saved.imported || importing };
++    fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
++    writeFileDurable({fs,path},file,JSON.stringify(record));
++    rows = next; saved = record;
++    if (old && action !== 'duplicate') Object.assign(state(old.id),{status:'unknown',latency:null,models:[],error:'',speed:null});
++    publish(list());
++    return list();
++  }
++  function transport(row, send) {
++    return (url, init = {}) => {
++      if (row !== rows.get(row.id) || !row.enabled) throw Error('Endpoint disabled or changed');
++      if (new URL(url).origin !== new URL(row.baseUrl).origin) throw Error('Endpoint origin mismatch');
++      const headers = new Headers(init.headers);
++      headers.delete('authorization'); headers.delete('x-api-key');
++      if (row.key) {
++        if (row.auth === 'x-api-key') headers.set('x-api-key',row.key);
++        else headers.set('authorization','Bearer '+row.key);
++      }
++      const timeout = AbortSignal.timeout(row.timeout);
++      if (init.signal && typeof AbortSignal.any !== 'function') throw Error('Nexus requires Node 22');
++      const signal = init.signal && typeof AbortSignal.any === 'function' ? AbortSignal.any([timeout,init.signal]) : timeout;
++      return send(url,{...init,headers,signal,redirect:'error'});
++    };
++  }
++  async function probe(id) {
++    const row = rows.get(id);
++    if (!row?.enabled) throw Error('Endpoint unavailable');
++    const s = state(id), start = performance.now();
++    try {
++      const res = await transport(row,fetch)(row.baseUrl+'/models');
++      if (!res.ok) throw Error('HTTP '+res.status);
++      const body = await res.json();
++      if (!Array.isArray(body.data)) throw Error('Invalid catalog');
++      if (row === rows.get(id)) Object.assign(s,{status:'online',error:'',models:body.data.map(m=>m.id).filter(m=>typeof m === 'string')});
++    } catch (e) {
++      if (row === rows.get(id)) Object.assign(s,{status:'offline',error:/^HTTP \d+$/.test(e.message) ? e.message : 'Discovery failed',models:[]});
++    }
++    if (row === rows.get(id)) s.latency = Math.round(performance.now()-start);
++    return s;
++  }
++  function direct(row,opts,build) {
++    const base = build({...opts,provider:row.id,key:row.key,headers:{},baseUrl:row.baseUrl,fetch:transport(row,opts.fetch || fetch)});
++    const s = state(row.id);
++    return {...base, contextLimit:row.context ? () => row.context : base.contextLimit,
++      supportsImages:row.vision === null ? base.supportsImages : () => row.vision,
++      async *stream(req) {
++        while (s.active >= row.concurrency) {
++          req.signal?.throwIfAborted();
++          await new Promise((resolve,reject) => {
++            function wake() { req.signal?.removeEventListener('abort',cancel); resolve(); }
++            function cancel() { s.waiting.splice(s.waiting.indexOf(wake),1); reject(req.signal.reason); }
++            s.waiting.push(wake); req.signal?.addEventListener('abort',cancel,{once:true});
++          });
++        }
++        const start = performance.now();
++        s.active++;
++        try {
++          for await (const event of base.stream(req)) {
++            const tokens = event.usage?.completion_tokens;
++            if (event.type === 'usage' && Number.isFinite(tokens)) s.speed = tokens*1000/Math.max(1,performance.now()-start);
++            yield event;
++          }
++        } finally { s.active--; s.waiting.shift()?.(); }
++      }};
++  }
++  function adapter(opts,build) {
++    const primary = rows.get(opts.provider);
++    if (!primary?.enabled) throw Error('Inference endpoint unavailable');
++    const base = direct(primary,opts,build);
++    if (primary.mode === 'manual') return base;
++    let choice;
++    async function select(req) {
++      const choices = [primary,...primary.alternatives.map(id=>rows.get(id))].filter(r=>r?.enabled &&
++        (primary.mode !== 'local' || privateTarget(r.baseUrl)) && (r === primary || ((!req.tools?.length || r.tools === true) &&
++        (primary.vision !== true || r.vision === true) && r.context >= primary.context && r.output >= primary.output)));
++      if (primary.mode === 'priority') choices.sort((a,b)=>b.priority-a.priority);
++      if (primary.mode === 'balance' && choices.length) {
++        choices.push(...choices.splice(0,cursor++ % choices.length));
++        const load = r => (state(r.id).active+state(r.id).waiting.length)/r.concurrency;
++        choices.sort((a,b)=>load(a)-load(b));
++      }
++      for (const r of choices) {
++        req.signal?.throwIfAborted();
++        const health = await probe(r.id);
++        if (health.status === 'online' && (health.models.includes(req.model) || r.model === req.model)) return r === primary ? base : direct(r,opts,build);
++      }
++      throw Error('No compatible authorized endpoint available');
++    }
++    return {...base, async *stream(req) {
++      choice ||= select(req);
++      const target = await choice;
++      if (primary !== rows.get(primary.id)) throw Error('Routing configuration changed');
++      yield* target.stream(req);
++    }};
++  }
++  publish(list());
++  return {list,save,adapter,probe,get:id=>rows.get(id),keys:()=>[...rows.values()].map(r=>r.key).filter(Boolean),
++    migrate(key,baseUrl) { if (!saved.imported && baseUrl) save('add',{name:'Custom endpoint (imported)',key,baseUrl},true); }};
++}
++module.exports = {networkStore};
+diff --git a/sidecar/providers/factory.js b/sidecar/providers/factory.js
+index 7a15c8e43..c121787cb 100644
+--- a/sidecar/providers/factory.js
++++ b/sidecar/providers/factory.js
+@@ -84,8 +84,14 @@
+   function attachRequestScrub(fn) { requestScrub = typeof fn === 'function' ? fn : null; return requestScrub; }
+   function guarded(provider) { return requestScrub ? requestScrub(provider) : provider; }
+ 
++  let network;
++  function attachNetwork(store) { network = store; }
+   function selectProvider(opts) {
+     opts = opts || {};
++    if (String(opts.provider).startsWith('nexus-')) {
++      if (!network) throw Error('Inference network unavailable');
++      return guarded(network.adapter(opts,buildAdapter));
++    }
+     // Configured OAuth fallbacks need metadata at admission, but authentication only if used.
+     // Cache a successful activation for this run. Failed activation stays retryable, and a
+     // cancelled caller never starts refresh/inference. No credential is shared across wrappers.
+@@ -275,7 +281,7 @@
+   }
+ 
+   return {
+-    selectProvider,
++    attachNetwork, selectProvider,
+     PROVIDER_IDS,
+     getProviderProfile: registry.getProviderProfile,
+     listProviderProfiles: registry.listProviderProfiles,
+diff --git a/sidecar/providers/registry.js b/sidecar/providers/registry.js
+index ebb0b877c..bdc6f539f 100644
+--- a/sidecar/providers/registry.js
++++ b/sidecar/providers/registry.js
+@@ -6,7 +6,7 @@
+ (function (root, factory) {
+   const api = factory();
+   if (typeof module !== 'undefined' && module.exports) module.exports = api;
+-  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.registry = api; }
++  else { root.SK = root.SK || {}; root.SK.providers = root.SK.providers || {}; root.SK.providers.registry = api; if (root.__NEXUS_NETWORK__) api.setNetwork(root.__NEXUS_NETWORK__); }
+ })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+   'use strict';
+ 
+@@ -636,18 +636,29 @@
+     for (const a of (profile.aliases || [])) ALIASES.set(String(a).toLowerCase(), profile.id);
+   }
+ 
++  let network = new Map();
++  function setNetwork(rows) {
++    network = new Map(rows.filter(r => /^nexus-[a-f0-9-]{36}$/.test(r.id)).map(r => [r.id, {
++      ...BY_ID.get('custom'), id:r.id, name:r.name, label:r.name, aliases:[], live:r.enabled,
++      baseUrl:r.baseUrl, endpoint:r.baseUrl, keyEnv:[], baseUrlEnv:[], credentialPool:false,
++      requiresBaseUrl:false, nativeOllama:r.protocol === 'ollama', supportsTools:r.tools,
++      maxOutputTokens:r.output, connectTimeoutMs:r.timeout, manualModel:r.model
++    }]));
++  }
+   function canonicalKey(value) {
+     return String(value || '').trim().toLowerCase();
+   }
+   function getProviderProfile(value) {
+     const key = canonicalKey(value);
+     if (!key) return null;
++    if (network.has(key)) return network.get(key);
+     const id = ALIASES.get(key);
+     return id ? BY_ID.get(id) || null : null;
+   }
+   function normalizeProviderId(value, fallback) {
+     const profile = getProviderProfile(value);
+     if (profile) return profile.id;
++    if (/^nexus-[a-f0-9-]{36}$/.test(value)) return value;
+     return fallback == null ? '' : String(fallback);
+   }
+   function providerUsesCodex(value) {
+@@ -698,7 +709,7 @@
+   }
+   function listProviderProfiles(opts) {
+     opts = opts || {};
+-    return PROFILES
++    return PROFILES.concat([...network.values()])
+       .filter(p => opts.includeInactive || p.live !== false)
+       .slice()
+       .sort((a, b) => (a.order || 1000) - (b.order || 1000) || a.id.localeCompare(b.id))
+@@ -719,6 +730,7 @@
+     providerRequiresKey,
+     providerRequiresBaseUrl,
+     providerIds,
++    setNetwork,
+     _profiles: PROFILES
+   };
+ });
